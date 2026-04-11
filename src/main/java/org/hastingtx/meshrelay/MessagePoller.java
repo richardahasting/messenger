@@ -47,7 +47,7 @@ public class MessagePoller implements Runnable {
     // ── Concurrency controls ──────────────────────────────────────────────
 
     /** How long to wait for a per-thread lock before giving up on this message. */
-    private static final long THREAD_LOCK_TIMEOUT_MINUTES = 15;
+    private static final long THREAD_LOCK_TIMEOUT_MINUTES = 12;
 
     /** True while a poll() run is executing. */
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
