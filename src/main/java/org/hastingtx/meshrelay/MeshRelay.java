@@ -80,8 +80,8 @@ public class MeshRelay {
 
         // Background poller — queries OpenBrain every 10 minutes.
         // Also triggered immediately by incoming wake-up pings.
-        // Swap MessageProcessor.logging() for a real Claude/Gemma4 processor later.
-        MessagePoller poller = new MessagePoller(config, brain, MessageProcessor.logging());
+        // Uses ClaudeProcessor if ANTHROPIC_API_KEY is set, logging() fallback otherwise.
+        MessagePoller poller = new MessagePoller(config, brain, ClaudeProcessor.create(client, config));
         poller.startInBackground();
 
         // ── HTTP server ───────────────────────────────────────────────────────
