@@ -114,45 +114,43 @@ public class OpenBrainStore {
      * Returns a list of pending messages, oldest first.
      */
     public java.util.List<PendingMessage> pollPendingMessages(String nodeName) {
-        java.util.List<PendingMessage> results = new java.util.ArrayList<>();
-
-        // Query for directed messages (to:thisNode) and broadcasts (to:all)
-        for (String toTag : new String[]{"to:" + nodeName, "to:all"}) {
-            try {
-                String body = """
-                    {
-                      "tool": "search_thoughts",
-                      "query": "mesh message pending",
-                      "mode": "keyword",
-                      "project": "mesh-messages",
-                      "status": "active",
-                      "tags": ["%s"],
-                      "limit": 50
-                    }
-                    """.formatted(toTag);
-
-                HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(mcpUrl))
-                    .timeout(TIMEOUT)
-                    .header("Content-Type", "application/json")
-                    .header("x-brain-key", brainKey)
-                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                    .build();
-
-                HttpResponse<String> response = client.send(
-                    request, HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() == 200) {
-                    results.addAll(parseMessages(response.body()));
-                } else {
-                    log.warning("OpenBrain poll returned HTTP " + response.statusCode());
+        // browse_thoughts does pure SQL filtering — no text search, no false misses.
+        // We fetch all active mesh-messages and filter by to:nodeName / to:all client-side.
+        try {
+            String body = """
+                {
+                  "tool": "browse_thoughts",
+                  "project": "mesh-messages",
+                  "status": "active",
+                  "limit": 50
                 }
-            } catch (Exception e) {
-                log.warning("OpenBrain poll failed for tag=" + toTag + ": " + e.getMessage());
-            }
-        }
+                """;
 
-        return results;
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                log.warning("OpenBrain poll returned HTTP " + response.statusCode());
+                return java.util.List.of();
+            }
+
+            // Filter client-side: keep only messages addressed to this node or broadcast
+            return parseMessages(response.body()).stream()
+                .filter(m -> m.toNode().equals(nodeName) || m.toNode().equals("all"))
+                .collect(java.util.stream.Collectors.toList());
+
+        } catch (Exception e) {
+            log.warning("OpenBrain poll failed: " + e.getMessage());
+            return java.util.List.of();
+        }
     }
 
     /**
@@ -206,16 +204,19 @@ public class OpenBrainStore {
                 "\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(obj);
             String content = contentM.find() ? unescape(contentM.group(1)) : "";
 
-            // Extract from: tag
+            // Extract from: and to: tags
             Matcher fromM = Pattern.compile("\"from:([^\"]+)\"").matcher(obj);
             String fromNode = fromM.find() ? fromM.group(1) : "unknown";
+
+            Matcher toM = Pattern.compile("\"to:([^\"]+)\"").matcher(obj);
+            String toNode = toM.find() ? toM.group(1) : "all";
 
             // thread_id — present once we migrate to the messages table;
             // for now (thoughts-based) it defaults to the thought's own id.
             Matcher threadM = Pattern.compile("\"thread_id\"\\s*:\\s*(\\d+)").matcher(obj);
             long threadId = threadM.find() ? Long.parseLong(threadM.group(1)) : (long) id;
 
-            messages.add(new PendingMessage(id, threadId, fromNode, content));
+            messages.add(new PendingMessage(id, threadId, fromNode, toNode, content));
         }
 
         return messages;
@@ -244,5 +245,5 @@ public class OpenBrainStore {
      *             serialization in MessagePoller). Once migrated to the messages
      *             table this will be the true thread_id; until then it equals thoughtId.
      */
-    public record PendingMessage(int thoughtId, long threadId, String fromNode, String content) {}
+    public record PendingMessage(int thoughtId, long threadId, String fromNode, String toNode, String content) {}
 }
