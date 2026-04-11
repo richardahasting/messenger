@@ -10,13 +10,14 @@ import java.util.regex.*;
  * Loads peer configuration from the existing agent-mesh config.json.
  * Reuses the same file so there is one source of truth for the mesh topology.
  *
- * Config format (same as current Python daemon):
+ * Config format (~/projects/messenger/config.json):
  * {
  *   "node_name": "linuxserver",
- *   "listen_port": 13003,
+ *   "listen_port": 13007,
+ *   "openbrain_url": "http://192.168.0.226:3000",
  *   "peers": [
- *     { "name": "macmini",      "url": "http://192.168.0.226:13003" },
- *     { "name": "macbook-air",  "url": "http://192.168.0.62:13003"  }
+ *     { "name": "macmini",      "url": "http://192.168.0.226:13007" },
+ *     { "name": "macbook-air",  "url": "http://192.168.0.62:13007"  }
  *   ]
  * }
  */

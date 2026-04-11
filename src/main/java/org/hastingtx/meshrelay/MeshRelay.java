@@ -35,7 +35,7 @@ public class MeshRelay {
     public static void main(String[] args) throws Exception {
         Path configPath = args.length > 0
             ? Path.of(args[0])
-            : Path.of(System.getProperty("user.home"), "projects/agent-mesh/config.json");
+            : Path.of(System.getProperty("user.home"), "projects/messenger/config.json");
 
         PeerConfig config = PeerConfig.load(configPath);
         log.info("Loaded config: " + config);
