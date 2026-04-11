@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
@@ -44,6 +45,9 @@ public class MessagePoller implements Runnable {
     private int     totalProcessed    = 0;
 
     // ── Concurrency controls ──────────────────────────────────────────────
+
+    /** How long to wait for a per-thread lock before giving up on this message. */
+    private static final long THREAD_LOCK_TIMEOUT_MINUTES = 15;
 
     /** True while a poll() run is executing. */
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
@@ -165,9 +169,27 @@ public class MessagePoller implements Runnable {
      * Messages with the same thread_id are serialized.
      */
     private void processWithThreadLock(OpenBrainStore.PendingMessage msg) {
-        long threadId = msg.threadId();   // see note below
+        long threadId = msg.threadId();
         ReentrantLock lock = threadLocks.computeIfAbsent(threadId, id -> new ReentrantLock());
-        lock.lock();
+        boolean acquired;
+        try {
+            acquired = lock.tryLock(THREAD_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warning("Interrupted waiting for thread lock thread_id=" + threadId
+                + " — skipping, will retry next poll");
+            return;
+        }
+
+        if (!acquired) {
+            // The previous message in this thread has been running for 15+ minutes.
+            // Leave this message unarchived so it will be retried next poll.
+            log.warning("Thread lock timeout (>" + THREAD_LOCK_TIMEOUT_MINUTES + "m) for thread_id="
+                + threadId + " from=" + msg.fromNode()
+                + " — skipping this cycle, will retry next poll");
+            return;
+        }
+
         try {
             processor.process(msg);
             brain.markArchived(msg.thoughtId());
