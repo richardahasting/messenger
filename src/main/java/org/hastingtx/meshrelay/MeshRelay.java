@@ -78,8 +78,13 @@ public class MeshRelay {
         // ── OpenBrain + poller ────────────────────────────────────────────────
         OpenBrainStore brain = new OpenBrainStore(client, config);
 
-        // Processor priority: Gemma (free, local) → Claude (paid API) → logging fallback
-        MessageProcessor processor = GemmaProcessor.create(client, config);
+        // Processor priority:
+        //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
+        //   2. GemmaProcessor     — local Ollama, works without internet
+        //   3. ClaudeProcessor    — raw Anthropic API (costs credits — last resort)
+        //   4. logging()          — safe no-op fallback
+        MessageProcessor processor = ClaudeCliProcessor.create(client, config);
+        if (processor == null) processor = GemmaProcessor.create(client, config);
         if (processor == null) processor = ClaudeProcessor.create(client, config);
 
         MessagePoller poller = new MessagePoller(config, brain, processor);
