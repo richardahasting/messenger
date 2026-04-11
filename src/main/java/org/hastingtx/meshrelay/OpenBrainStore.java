@@ -210,7 +210,12 @@ public class OpenBrainStore {
             Matcher fromM = Pattern.compile("\"from:([^\"]+)\"").matcher(obj);
             String fromNode = fromM.find() ? fromM.group(1) : "unknown";
 
-            messages.add(new PendingMessage(id, fromNode, content));
+            // thread_id — present once we migrate to the messages table;
+            // for now (thoughts-based) it defaults to the thought's own id.
+            Matcher threadM = Pattern.compile("\"thread_id\"\\s*:\\s*(\\d+)").matcher(obj);
+            long threadId = threadM.find() ? Long.parseLong(threadM.group(1)) : (long) id;
+
+            messages.add(new PendingMessage(id, threadId, fromNode, content));
         }
 
         return messages;
@@ -231,6 +236,13 @@ public class OpenBrainStore {
         return m.find() ? Integer.parseInt(m.group(1)) : -1;
     }
 
-    /** A pending message retrieved from OpenBrain. */
-    public record PendingMessage(int thoughtId, String fromNode, String content) {}
+    /**
+     * A pending message retrieved from OpenBrain.
+     *
+     * thoughtId — the OpenBrain thought/message id (used for markArchived)
+     * threadId  — conversation thread this message belongs to (used for per-thread
+     *             serialization in MessagePoller). Once migrated to the messages
+     *             table this will be the true thread_id; until then it equals thoughtId.
+     */
+    public record PendingMessage(int thoughtId, long threadId, String fromNode, String content) {}
 }
