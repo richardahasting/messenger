@@ -47,15 +47,19 @@ public class PeerConfig {
     public final String openBrainUrl;
     public final String openBrainKey;
     public final String source;                   // "openbrain", "cache", or "local"
+    /** Optional processor override: "gemma" | "claude-cli" | null (auto). */
+    public final String processor;
 
     private PeerConfig(String nodeName, int listenPort, Map<String, String> peers,
-                       String openBrainUrl, String openBrainKey, String source) {
+                       String openBrainUrl, String openBrainKey, String source,
+                       String processor) {
         this.nodeName     = nodeName;
         this.listenPort   = listenPort;
         this.peers        = Collections.unmodifiableMap(peers);
         this.openBrainUrl = openBrainUrl;
         this.openBrainKey = openBrainKey;
         this.source       = source;
+        this.processor    = processor;
     }
 
     /**
@@ -166,7 +170,9 @@ public class PeerConfig {
             peers.put(peerBlock.group(1), peerBlock.group(2));
         }
 
-        return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source);
+        String processor = extractStringOpt(json, "processor");
+
+        return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source, processor);
     }
 
     private static void writeCache(Path cacheFile, String content) {
@@ -209,6 +215,7 @@ public class PeerConfig {
     @Override
     public String toString() {
         return "PeerConfig{node=" + nodeName + ", port=" + listenPort
-            + ", peers=" + peers.keySet() + ", source=" + source + "}";
+            + ", peers=" + peers.keySet() + ", source=" + source
+            + (processor != null ? ", processor=" + processor : "") + "}";
     }
 }

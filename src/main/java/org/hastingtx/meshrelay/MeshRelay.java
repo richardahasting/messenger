@@ -78,14 +78,35 @@ public class MeshRelay {
         // ── OpenBrain + poller ────────────────────────────────────────────────
         OpenBrainStore brain = new OpenBrainStore(client, config);
 
-        // Processor priority:
-        //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
-        //   2. GemmaProcessor     — local Ollama, works without internet
-        //   3. ClaudeProcessor    — raw Anthropic API (costs credits — last resort)
-        //   4. logging()          — safe no-op fallback
-        MessageProcessor processor = ClaudeCliProcessor.create(client, config);
-        if (processor == null) processor = GemmaProcessor.create(client, config);
-        if (processor == null) processor = ClaudeProcessor.create(client, config);
+        // Processor selection — config.processor overrides auto-detection:
+        //   "gemma"     → GemmaProcessor only (dedicated Ollama agent)
+        //   "claude-cli"→ ClaudeCliProcessor only
+        //   null/absent → auto priority: ClaudeCliProcessor → GemmaProcessor → ClaudeProcessor
+        MessageProcessor processor;
+        if ("gemma".equals(config.processor)) {
+            log.info("Processor forced to Gemma via config");
+            processor = GemmaProcessor.create(client, config);
+            if (processor == null) {
+                log.severe("processor=gemma requested but Ollama is unreachable — exiting.");
+                System.exit(1);
+            }
+        } else if ("claude-cli".equals(config.processor)) {
+            log.info("Processor forced to Claude CLI via config");
+            processor = ClaudeCliProcessor.create(client, config);
+            if (processor == null) {
+                log.severe("processor=claude-cli requested but claude binary not found — exiting.");
+                System.exit(1);
+            }
+        } else {
+            // Auto priority:
+            //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
+            //   2. GemmaProcessor     — local Ollama, works without internet
+            //   3. ClaudeProcessor    — raw Anthropic API (costs credits — last resort)
+            //   4. logging()          — safe no-op fallback
+            processor = ClaudeCliProcessor.create(client, config);
+            if (processor == null) processor = GemmaProcessor.create(client, config);
+            if (processor == null) processor = ClaudeProcessor.create(client, config);
+        }
 
         MessagePoller poller = new MessagePoller(config, brain, processor);
         poller.startInBackground();
