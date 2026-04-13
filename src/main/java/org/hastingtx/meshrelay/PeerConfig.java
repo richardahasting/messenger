@@ -72,7 +72,11 @@ public class PeerConfig {
         if (nodeName == null) throw new IllegalArgumentException("Missing config key: node_name");
         String obUrl = boot.getString("openbrain_url", "http://192.168.0.226:3000");
         String obKey = System.getenv("OPENBRAIN_KEY");
-        if (obKey == null) obKey = boot.getString("openbrain_key", "axlv8KWl_wHBmjylHkltJF0R4gkRjDPW0ibx-yp7bUQ");
+        if (obKey == null) obKey = boot.getString("openbrain_key");
+        if (obKey == null) {
+            throw new IllegalArgumentException(
+                "OpenBrain key not found. Set OPENBRAIN_KEY env var or openbrain_key in config.json");
+        }
 
         Path cacheFile = Path.of(System.getProperty("user.home"), ".messenger-config.cache");
 
