@@ -2,6 +2,8 @@ package org.hastingtx.meshrelay;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -65,6 +67,16 @@ public class MessagePoller implements Runnable {
      * unbounded map growth.
      */
     private final ConcurrentHashMap<Long, ReentrantLock> threadLocks = new ConcurrentHashMap<>();
+
+    // ── Per-sender rate limiting ──────────────────────────────────────────
+    // Prevents chatty agents (e.g. Gemma hallucinating tasks) from flooding
+    // the processor. 3 messages per 10 minutes per sender.
+
+    private static final int    RATE_LIMIT_MAX     = 3;
+    private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(10);
+
+    /** sender → timestamps of recently processed messages (sliding window). */
+    private final ConcurrentHashMap<String, Deque<Instant>> senderTimestamps = new ConcurrentHashMap<>();
 
     public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor) {
         this.config    = config;
@@ -159,7 +171,39 @@ public class MessagePoller implements Runnable {
         log.info("Poll found " + pending.size() + " pending message(s)");
 
         for (OpenBrainStore.PendingMessage msg : pending) {
+            if (isRateLimited(msg.fromNode())) {
+                log.warning("Rate limited sender=" + msg.fromNode()
+                    + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
+                    + " — archiving thread_id=" + msg.threadId() + " without processing");
+                brain.markArchived(msg.thoughtId());
+                continue;
+            }
             processWithThreadLock(msg);
+        }
+    }
+
+    /**
+     * Check if a sender has exceeded the rate limit (sliding window).
+     * Returns true if the sender should be throttled.
+     */
+    private boolean isRateLimited(String sender) {
+        Deque<Instant> timestamps = senderTimestamps.computeIfAbsent(sender, k -> new ArrayDeque<>());
+        Instant cutoff = Instant.now().minus(RATE_LIMIT_WINDOW);
+
+        synchronized (timestamps) {
+            // Evict timestamps outside the window
+            while (!timestamps.isEmpty() && timestamps.peekFirst().isBefore(cutoff)) {
+                timestamps.pollFirst();
+            }
+            return timestamps.size() >= RATE_LIMIT_MAX;
+        }
+    }
+
+    /** Record that a message from this sender was processed. */
+    private void recordProcessed(String sender) {
+        Deque<Instant> timestamps = senderTimestamps.computeIfAbsent(sender, k -> new ArrayDeque<>());
+        synchronized (timestamps) {
+            timestamps.addLast(Instant.now());
         }
     }
 
@@ -203,6 +247,7 @@ public class MessagePoller implements Runnable {
             try {
                 processor.process(msg);
                 brain.markArchived(msg.thoughtId());
+                recordProcessed(msg.fromNode());
                 totalProcessed++;
                 log.info("Processed message thread_id=" + threadId
                     + " from=" + msg.fromNode()
