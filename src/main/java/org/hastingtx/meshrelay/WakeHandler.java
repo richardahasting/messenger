@@ -42,8 +42,9 @@ public class WakeHandler implements HttpHandler {
         String body = new String(
             exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 
-        String fromNode = RelayHandler.extractField(body, "from");
-        String threadId = RelayHandler.extractField(body, "thread_id");
+        Json json       = Json.parse(body);
+        String fromNode = json.getString("from");
+        String threadId = json.getString("thread_id");
 
         // Log and trigger an immediate poll — no need to wait 10 minutes
         log.info("Wake-up received: thread_id=" + threadId + " from=" + fromNode

@@ -76,9 +76,10 @@ public class RelayHandler implements HttpHandler {
             return;
         }
 
-        String toNode   = extractField(body, "to");
-        String fromNode = extractField(body, "from");
-        String content  = extractField(body, "content");
+        Json json       = Json.parse(body);
+        String toNode   = json.getString("to");
+        String fromNode = json.getString("from");
+        String content  = json.getString("content");
 
         if (toNode == null || toNode.isBlank()) {
             sendError(exchange, 400, "Missing required field: 'to'");
@@ -183,17 +184,6 @@ public class RelayHandler implements HttpHandler {
             + " failed after " + WAKEUP_MAX_ATTEMPTS + " attempts — "
             + "message thread_id=" + threadId + " safe in OpenBrain, peer will catch up");
         return false;
-    }
-
-    /** Simple field extractor — avoids pulling in a JSON library. */
-    static String extractField(String json, String key) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return null;
-        int colon = json.indexOf(':', idx);
-        int q1    = json.indexOf('"', colon + 1);
-        int q2    = json.indexOf('"', q1 + 1);
-        if (colon < 0 || q1 < 0 || q2 < 0) return null;
-        return json.substring(q1 + 1, q2);
     }
 
     private void sendError(HttpExchange exchange, int code, String message) throws IOException {

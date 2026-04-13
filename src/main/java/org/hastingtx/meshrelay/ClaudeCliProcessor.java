@@ -13,8 +13,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * MessageProcessor that delegates to the Claude Code CLI (claude -p).
@@ -131,30 +129,26 @@ public class ClaudeCliProcessor implements MessageProcessor {
     private String parseCliOutput(String stdout, long threadId) {
         if (stdout.isEmpty()) return "[no output]";
 
-        // claude --output-format json returns: {"result":"...","session_id":"..."}
-        Matcher sessionM = Pattern.compile("\"session_id\"\\s*:\\s*\"([^\"]+)\"").matcher(stdout);
-        if (sessionM.find()) {
-            String sid = sessionM.group(1);
-            sessions.put(threadId, sid);
-            log.fine("Session stored thread_id=" + threadId + " session=" + sid);
+        try {
+            Json out = Json.parse(stdout);
+            String sid = out.getString("session_id");
+            if (sid != null) {
+                sessions.put(threadId, sid);
+                log.fine("Session stored thread_id=" + threadId + " session=" + sid);
+            }
+            String result = out.getString("result");
+            if (result != null) return result;
+        } catch (Exception ignored) {
+            // JSON parse failed — fall through to raw output
         }
 
-        Matcher resultM = Pattern.compile("\"result\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(stdout);
-        if (resultM.find()) {
-            return resultM.group(1)
-                .replace("\\n", "\n").replace("\\t", "\t")
-                .replace("\\r", "\r").replace("\\\"", "\"")
-                .replace("\\\\", "\\");
-        }
-
-        // Fallback: return raw stdout if JSON parse fails
         return stdout.length() > 2000 ? stdout.substring(0, 2000) + "…" : stdout;
     }
 
     private void sendReply(String toNode, String content, long threadId) throws Exception {
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
-            + "\"content\":\"" + jsonEscape(content) + "\","
+            + "\"content\":\"" + Json.escape(content) + "\","
             + "\"thread_id\":" + threadId + "}";
 
         HttpRequest req = HttpRequest.newBuilder()
@@ -220,8 +214,4 @@ public class ClaudeCliProcessor implements MessageProcessor {
         return env;
     }
 
-    private String jsonEscape(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
-    }
 }

@@ -10,8 +10,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.logging.Logger;
-import java.util.regex.*;
-
 /**
  * Loads peer configuration — OpenBrain is the primary source of truth.
  *
@@ -68,13 +66,13 @@ public class PeerConfig {
      */
     public static PeerConfig load(Path configFile) throws IOException {
         String bootstrap = Files.readString(configFile);
+        Json boot = Json.parse(bootstrap);
 
-        String nodeName = extractString(bootstrap, "node_name");
-        String obUrl    = extractStringOpt(bootstrap, "openbrain_url");
-        if (obUrl == null) obUrl = "http://192.168.0.226:3000";
+        String nodeName = boot.getString("node_name");
+        if (nodeName == null) throw new IllegalArgumentException("Missing config key: node_name");
+        String obUrl = boot.getString("openbrain_url", "http://192.168.0.226:3000");
         String obKey = System.getenv("OPENBRAIN_KEY");
-        if (obKey == null) obKey = extractStringOpt(bootstrap, "openbrain_key");
-        if (obKey == null) obKey = "axlv8KWl_wHBmjylHkltJF0R4gkRjDPW0ibx-yp7bUQ";
+        if (obKey == null) obKey = boot.getString("openbrain_key", "axlv8KWl_wHBmjylHkltJF0R4gkRjDPW0ibx-yp7bUQ");
 
         Path cacheFile = Path.of(System.getProperty("user.home"), ".messenger-config.cache");
 
@@ -117,10 +115,9 @@ public class PeerConfig {
                                               String obUrl,
                                               String obKey,
                                               String nodeName) throws Exception {
-        // browse_thoughts: deterministic SQL filter — no fuzziness
         String body = "{\"tool\":\"browse_thoughts\","
             + "\"project\":\"messenger\","
-            + "\"node\":\"" + nodeName + "\","
+            + "\"node\":\"" + Json.escape(nodeName) + "\","
             + "\"task_type\":\"config\","
             + "\"limit\":1}";
 
@@ -136,21 +133,11 @@ public class PeerConfig {
         if (resp.statusCode() != 200)
             throw new IOException("OpenBrain returned HTTP " + resp.statusCode());
 
-        // Response is a JSON array of thoughts — extract content of first element
-        String responseBody = resp.body();
-        // Find the first "content" field value in the response
-        Matcher m = Pattern.compile("\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-            .matcher(responseBody);
-        if (!m.find())
+        Json thoughts = Json.parse(resp.body());
+        if (!thoughts.isArray() || thoughts.size() == 0)
             throw new IOException("No config thought found in OpenBrain for node=" + nodeName);
 
-        // Unescape JSON string escapes (the content is stored as escaped JSON)
-        return m.group(1)
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t");
+        return thoughts.asList().get(0).getString("content");
     }
 
     /**
@@ -160,17 +147,17 @@ public class PeerConfig {
     private static PeerConfig parseConfig(String json, String nodeName,
                                            String obUrl, String obKey,
                                            String source) {
-        int listenPort = extractIntOpt(json, "listen_port", 13007);
+        Json cfg = Json.parse(json);
+        int listenPort = cfg.getInt("listen_port", 13007);
 
         Map<String, String> peers = new LinkedHashMap<>();
-        Matcher peerBlock = Pattern.compile(
-            "\\{[^{}]*\"name\"\\s*:\\s*\"([^\"]+)\"[^{}]*\"url\"\\s*:\\s*\"([^\"]+)\"[^{}]*\\}"
-        ).matcher(json);
-        while (peerBlock.find()) {
-            peers.put(peerBlock.group(1), peerBlock.group(2));
+        if (cfg.has("peers")) {
+            for (Json peer : cfg.get("peers").asList()) {
+                peers.put(peer.getString("name"), peer.getString("url"));
+            }
         }
 
-        String processor = extractStringOpt(json, "processor");
+        String processor = cfg.getString("processor");
 
         return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source, processor);
     }
@@ -181,30 +168,6 @@ public class PeerConfig {
         } catch (IOException e) {
             log.warning("Could not write config cache: " + e.getMessage());
         }
-    }
-
-    // ── Regex helpers ─────────────────────────────────────────────────────────
-
-    private static String extractString(String json, String key) {
-        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
-        if (!m.find()) throw new IllegalArgumentException("Missing config key: " + key);
-        return m.group(1);
-    }
-
-    private static String extractStringOpt(String json, String key) {
-        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
-        return m.find() ? m.group(1) : null;
-    }
-
-    private static int extractInt(String json, String key) {
-        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*(\\d+)").matcher(json);
-        if (!m.find()) throw new IllegalArgumentException("Missing config key: " + key);
-        return Integer.parseInt(m.group(1));
-    }
-
-    private static int extractIntOpt(String json, String key, int defaultValue) {
-        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*(\\d+)").matcher(json);
-        return m.find() ? Integer.parseInt(m.group(1)) : defaultValue;
     }
 
     /** Return the URL for a named peer, or null if unknown. */

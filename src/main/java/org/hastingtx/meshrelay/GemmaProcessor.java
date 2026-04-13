@@ -7,8 +7,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * MessageProcessor that sends incoming messages to a local Gemma model via
@@ -101,11 +99,11 @@ public class GemmaProcessor implements MessageProcessor {
             + "Keep replies focused and brief.";
 
         String body = "{"
-            + "\"model\":\"" + jsonEscape(model) + "\","
+            + "\"model\":\"" + Json.escape(model) + "\","
             + "\"stream\":false,"
             + "\"messages\":["
-            + "{\"role\":\"system\",\"content\":\"" + jsonEscape(systemPrompt) + "\"},"
-            + "{\"role\":\"user\",\"content\":\"" + jsonEscape(userContent) + "\"}"
+            + "{\"role\":\"system\",\"content\":\"" + Json.escape(systemPrompt) + "\"},"
+            + "{\"role\":\"user\",\"content\":\"" + Json.escape(userContent) + "\"}"
             + "]}";
 
         HttpRequest request = HttpRequest.newBuilder()
@@ -128,7 +126,7 @@ public class GemmaProcessor implements MessageProcessor {
     private void sendReply(String toNode, String replyContent, long threadId) throws Exception {
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
-            + "\"content\":\"" + jsonEscape(replyContent) + "\","
+            + "\"content\":\"" + Json.escape(replyContent) + "\","
             + "\"thread_id\":" + threadId + "}";
 
         HttpRequest request = HttpRequest.newBuilder()
@@ -146,20 +144,9 @@ public class GemmaProcessor implements MessageProcessor {
 
     /** Extract assistant content from Ollama /api/chat response. */
     private String extractReplyText(String json) {
-        // {"message":{"role":"assistant","content":"..."},...}
-        Matcher m = Pattern.compile(
-            "\"message\"\\s*:\\s*\\{[^}]*\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-            .matcher(json);
-        if (!m.find()) throw new IllegalStateException("No content in Ollama response: "
+        String content = Json.parse(json).get("message").getString("content");
+        if (content == null) throw new IllegalStateException("No content in Ollama response: "
             + json.substring(0, Math.min(300, json.length())));
-        return m.group(1)
-            .replace("\\n", "\n").replace("\\t", "\t")
-            .replace("\\r", "\r").replace("\\\"", "\"")
-            .replace("\\\\", "\\");
-    }
-
-    private String jsonEscape(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+        return content;
     }
 }

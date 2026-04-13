@@ -101,11 +101,10 @@ public class MeshRelay {
             // Auto priority:
             //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
             //   2. GemmaProcessor     — local Ollama, works without internet
-            //   3. ClaudeProcessor    — raw Anthropic API (costs credits — last resort)
-            //   4. logging()          — safe no-op fallback
+            //   3. logging()          — safe no-op fallback
             processor = ClaudeCliProcessor.create(client, config);
             if (processor == null) processor = GemmaProcessor.create(client, config);
-            if (processor == null) processor = ClaudeProcessor.create(client, config);
+            if (processor == null) processor = MessageProcessor.logging();
         }
 
         MessagePoller poller = new MessagePoller(config, brain, processor);

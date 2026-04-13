@@ -7,8 +7,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Writes mesh messages to OpenBrain as thoughts.
@@ -25,7 +23,6 @@ public class OpenBrainStore {
 
     private static final Logger log = Logger.getLogger(OpenBrainStore.class.getName());
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
-    private static final Pattern ID_PATTERN = Pattern.compile("\"id\"\\s*:\\s*(\\d+)");
 
     private final HttpClient client;
     private final String mcpUrl;   // e.g. http://192.168.0.226:3000/mcp
@@ -69,7 +66,7 @@ public class OpenBrainStore {
                 + ": " + response.body());
         }
 
-        int id = extractId(response.body());
+        int id = Json.parse(response.body()).getInt("id", -1);
         if (id < 0) {
             throw new Exception("OpenBrain response missing 'id' field: " + response.body());
         }
@@ -81,13 +78,7 @@ public class OpenBrainStore {
 
     /** Build the JSON body for capture_thought using the legacy simple format. */
     private String buildCaptureJson(String fromNode, String toNode, String content) {
-        // Escape the content for JSON embedding
-        String escaped = content
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
+        String escaped = Json.escape(content);
 
         return """
             {
@@ -179,62 +170,35 @@ public class OpenBrainStore {
     }
 
     /**
-     * Parse a JSON array of thought objects from an OpenBrain search response.
-     * Extracts id, content, and the "from:" tag value.
+     * Parse a JSON array of thought objects from an OpenBrain response.
+     * Extracts id, content, and the "from:"/"to:" tag values.
      */
     private java.util.List<PendingMessage> parseMessages(String json) {
         java.util.List<PendingMessage> messages = new java.util.ArrayList<>();
+        Json thoughts = Json.parse(json);
+        if (!thoughts.isArray()) return messages;
 
-        // Each thought object is bounded by { }. Extract all top-level objects.
-        // We look for "id": N, "content": "...", and tags containing "from:..."
-        Matcher objectMatcher = Pattern.compile(
-            "\\{[^{}]*\"id\"\\s*:\\s*(\\d+)[^{}]*\\}"
-        ).matcher(json);
+        for (Json thought : thoughts.asList()) {
+            int id = thought.getInt("id", -1);
+            if (id < 0) continue;
 
-        while (objectMatcher.find()) {
-            String obj = objectMatcher.group();
+            String content  = thought.getString("content", "");
+            String fromNode = "unknown";
+            String toNode   = "all";
 
-            // Extract id
-            Matcher idM = ID_PATTERN.matcher(obj);
-            if (!idM.find()) continue;
-            int id = Integer.parseInt(idM.group(1));
+            for (Json tag : thought.get("tags").asList()) {
+                String t = tag.asString();
+                if (t.startsWith("from:")) fromNode = t.substring(5);
+                else if (t.startsWith("to:")) toNode = t.substring(3);
+            }
 
-            // Extract content
-            Matcher contentM = Pattern.compile(
-                "\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(obj);
-            String content = contentM.find() ? unescape(contentM.group(1)) : "";
-
-            // Extract from: and to: tags
-            Matcher fromM = Pattern.compile("\"from:([^\"]+)\"").matcher(obj);
-            String fromNode = fromM.find() ? fromM.group(1) : "unknown";
-
-            Matcher toM = Pattern.compile("\"to:([^\"]+)\"").matcher(obj);
-            String toNode = toM.find() ? toM.group(1) : "all";
-
-            // thread_id — present once we migrate to the messages table;
-            // for now (thoughts-based) it defaults to the thought's own id.
-            Matcher threadM = Pattern.compile("\"thread_id\"\\s*:\\s*(\\d+)").matcher(obj);
-            long threadId = threadM.find() ? Long.parseLong(threadM.group(1)) : (long) id;
+            long threadId = thought.has("thread_id")
+                ? thought.getLong("thread_id") : (long) id;
 
             messages.add(new PendingMessage(id, threadId, fromNode, toNode, content));
         }
 
         return messages;
-    }
-
-    /** Unescape basic JSON string escapes. */
-    private String unescape(String s) {
-        return s.replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\r", "\r")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
-    }
-
-    /** Extract the numeric "id" field from the JSON response. */
-    private int extractId(String json) {
-        Matcher m = ID_PATTERN.matcher(json);
-        return m.find() ? Integer.parseInt(m.group(1)) : -1;
     }
 
     /**
