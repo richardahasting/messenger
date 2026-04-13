@@ -130,7 +130,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
             cmd.add("-p");
             cmd.add("--resume");
             cmd.add(sessionId);
-            cmd.add("Summarize this conversation concisely in 2-3 sentences: key decisions, outcomes, and any pending items.");
+            cmd.add(SystemPrompt.summarize());
             cmd.add("--model");         cmd.add(model);
             cmd.add("--output-format"); cmd.add("json");
             cmd.add("--dangerously-skip-permissions");
@@ -201,19 +201,17 @@ public class ClaudeCliProcessor implements MessageProcessor {
             cmd.add(userContent);
         } else {
             // New session — build system prompt, check for prior context in OpenBrain
-            String systemPrompt = "You are the " + config.nodeName
-                + " agent in a distributed multi-agent system. "
-                + "You are receiving a message from the " + fromNode + " agent. "
-                + "Respond helpfully and concisely. "
-                + "You have full tool access — use bash for any system commands requested.";
+            StringBuilder prompt = new StringBuilder();
+            prompt.append(SystemPrompt.build(config, fromNode, threadId, true));
 
             String priorContext = brain.fetchSessionContext(threadId);
             if (priorContext != null) {
-                systemPrompt += "\n\nPrevious conversation context:\n" + priorContext;
+                prompt.append("\n\n## Previous Conversation Context\n\n").append(priorContext);
                 log.info("Loaded prior session context for thread_id=" + threadId);
             }
 
-            cmd.add(systemPrompt + "\n\n" + userContent);
+            prompt.append("\n\n---\n\n").append(userContent);
+            cmd.add(prompt.toString());
         }
 
         cmd.add("--model");         cmd.add(model);

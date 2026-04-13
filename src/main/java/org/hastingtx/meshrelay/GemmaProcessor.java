@@ -85,18 +85,14 @@ public class GemmaProcessor implements MessageProcessor {
         log.info("Processing message via Gemma — thread_id=" + msg.threadId()
             + " from=" + msg.fromNode());
 
-        String reply = callGemma(msg.fromNode(), msg.content());
+        String reply = callGemma(msg.fromNode(), msg.threadId(), msg.content());
         sendReply(msg.fromNode(), reply, msg.threadId());
 
         log.info("Reply sent to " + msg.fromNode() + " thread_id=" + msg.threadId());
     }
 
-    private String callGemma(String fromNode, String userContent) throws Exception {
-        String systemPrompt = "You are the " + config.nodeName
-            + " agent in a distributed multi-agent system. "
-            + "You are receiving a message from the " + fromNode + " agent. "
-            + "Respond helpfully and concisely — your reply will be delivered back as a message. "
-            + "Keep replies focused and brief.";
+    private String callGemma(String fromNode, long threadId, String userContent) throws Exception {
+        String systemPrompt = SystemPrompt.build(config, fromNode, threadId, false);
 
         String body = "{"
             + "\"model\":\"" + Json.escape(model) + "\","
