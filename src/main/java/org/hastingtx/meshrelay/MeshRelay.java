@@ -48,7 +48,10 @@ public class MeshRelay {
         // Keep the FileChannel open for the entire process lifetime; closing it
         // releases the lock. The shutdown hook closes it on clean exit; the OS
         // reclaims it on crash or kill.
-        Path lockFile = Path.of(System.getProperty("user.home"), ".messenger.lock");
+        String configArg = args.length > 0 ? Path.of(args[0]).getFileName().toString() : "config.json";
+        String lockSuffix = configArg.replaceAll("^config-?", "").replaceAll("\\.json$", "");
+        String lockName = lockSuffix.isEmpty() ? ".messenger.lock" : ".messenger-" + lockSuffix + ".lock";
+        Path lockFile = Path.of(System.getProperty("user.home"), lockName);
         FileChannel lockChannel = FileChannel.open(lockFile,
             StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         FileLock instanceLock = lockChannel.tryLock();

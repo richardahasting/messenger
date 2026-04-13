@@ -5,3 +5,5 @@ target/
 *.iml
 .DS_Store
 .env
+config.json
+config-*.json
