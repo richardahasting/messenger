@@ -122,7 +122,7 @@ public class MeshRelay {
         server.createContext("/relay",     new RelayHandler(client, config, brain));
         server.createContext("/broadcast", new BroadcastHandler(client, config, brain));
         server.createContext("/wake",      new WakeHandler(config, poller));
-        server.createContext("/health",    new HealthHandler(config, poller));
+        server.createContext("/health",    new HealthHandler(config, poller, java.time.Instant.now()));
         server.createContext("/ping", exchange -> {
             byte[] pong = "pong".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, pong.length);

@@ -14,13 +14,14 @@ import java.time.Instant;
  */
 public class HealthHandler implements HttpHandler {
 
-    private static final Instant START_TIME = Instant.now();
+    private final Instant        startTime;
     private final PeerConfig    config;
     private final MessagePoller poller;
 
-    public HealthHandler(PeerConfig config, MessagePoller poller) {
-        this.config = config;
-        this.poller = poller;
+    public HealthHandler(PeerConfig config, MessagePoller poller, Instant startTime) {
+        this.config    = config;
+        this.poller    = poller;
+        this.startTime = startTime;
     }
 
     @Override
@@ -31,7 +32,7 @@ public class HealthHandler implements HttpHandler {
             return;
         }
 
-        long uptimeSeconds = Instant.now().getEpochSecond() - START_TIME.getEpochSecond();
+        long uptimeSeconds = Instant.now().getEpochSecond() - startTime.getEpochSecond();
 
         String lastPoll = poller.getLastPollTime().equals(java.time.Instant.EPOCH)
             ? "never" : poller.getLastPollTime().toString();
