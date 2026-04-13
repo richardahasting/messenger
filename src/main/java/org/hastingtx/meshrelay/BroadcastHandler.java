@@ -56,18 +56,24 @@ public class BroadcastHandler implements HttpHandler {
         String body = new String(
             exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 
-        String fromNode = RelayHandler.extractField(body, "from");
-        String content  = RelayHandler.extractField(body, "content");
+        Json json       = Json.parse(body);
+        String fromNode = json.getString("from");
+        String content  = json.getString("content");
         if (fromNode == null) fromNode = config.nodeName;
 
         // Store the broadcast in OpenBrain once, tagged to:all
-        int threadId = -1;
-        if (content != null) {
-            try {
-                threadId = brain.storeMessage(fromNode, "all", content);
-            } catch (Exception e) {
-                log.warning("Broadcast store in OpenBrain failed: " + e.getMessage());
-            }
+        // This is the only hard failure point — same as RelayHandler.
+        int threadId;
+        if (content == null || content.isBlank()) {
+            sendError(exchange, 400, "Missing required field: 'content'");
+            return;
+        }
+        try {
+            threadId = brain.storeMessage(fromNode, "all", content);
+        } catch (Exception e) {
+            log.severe("Failed to store broadcast in OpenBrain: " + e.getMessage());
+            sendError(exchange, 503, "message_store_unavailable");
+            return;
         }
         final int finalThreadId = threadId;
         final String finalFrom  = fromNode;
@@ -131,5 +137,14 @@ public class BroadcastHandler implements HttpHandler {
         sb.setLength(sb.length() - 1);
         sb.append("]");
         return sb.toString();
+    }
+
+    private void sendError(HttpExchange exchange, int code, String message) throws IOException {
+        String b = "{\"error\":\"" + message + "\"}";
+        byte[] bytes = b.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(code, bytes.length);
+        exchange.getResponseBody().write(bytes);
+        exchange.close();
     }
 }
