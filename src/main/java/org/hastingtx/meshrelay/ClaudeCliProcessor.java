@@ -9,8 +9,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
@@ -30,6 +32,12 @@ import java.util.logging.Logger;
  *   conversation thread maps to one persistent Claude session — Claude
  *   remembers the full thread context without re-sending history.
  *
+ * Session lifecycle:
+ *   1. Active session — thread_id maps to a live Claude session_id (--resume)
+ *   2. Expiry — session unused for SESSION_TTL_MINUTES is eligible for eviction
+ *   3. Before eviction — summarize the conversation via Claude, store in OpenBrain
+ *   4. New session for expired thread — load prior summary from OpenBrain as context
+ *
  * Activation: requires the claude CLI to be on PATH or at known locations.
  * Falls back gracefully if the binary is not found.
  */
@@ -39,27 +47,119 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
     private static final String MODEL   = "claude-sonnet-4-6";
     private static final int    TIMEOUT_MINUTES = 12;   // matches thread lock timeout
+    private static final int    SESSION_TTL_MINUTES = 45;
+    private static final int    REAPER_INTERVAL_MINUTES = 5;
 
-    /** thread_id → Claude session_id for conversation continuity. */
-    private final ConcurrentHashMap<Long, String> sessions = new ConcurrentHashMap<>();
+    /** Tracks a Claude session and when it was last used. */
+    record SessionEntry(String sessionId, Instant lastUsed) {}
 
-    private final HttpClient http;
-    private final PeerConfig config;
-    private final String     claudeBin;
-    private final String     relayUrl;
+    /** thread_id → session entry for conversation continuity. */
+    private final ConcurrentHashMap<Long, SessionEntry> sessions = new ConcurrentHashMap<>();
 
-    private ClaudeCliProcessor(HttpClient http, PeerConfig config, String claudeBin) {
+    private final HttpClient      http;
+    private final PeerConfig      config;
+    private final OpenBrainStore  brain;
+    private final String          claudeBin;
+    private final String          relayUrl;
+
+    private ClaudeCliProcessor(HttpClient http, PeerConfig config,
+                                OpenBrainStore brain, String claudeBin) {
         this.http      = http;
         this.config    = config;
+        this.brain     = brain;
         this.claudeBin = claudeBin;
         this.relayUrl  = "http://localhost:" + config.listenPort + "/relay";
+        startSessionReaper();
+    }
+
+    /** Background thread that evicts expired sessions, summarizing first. */
+    private void startSessionReaper() {
+        Thread.ofVirtual().name("session-reaper").start(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(Duration.ofMinutes(REAPER_INTERVAL_MINUTES));
+                    reapExpiredSessions();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+        log.info("Session reaper started — TTL=" + SESSION_TTL_MINUTES + "m, check interval="
+            + REAPER_INTERVAL_MINUTES + "m");
+    }
+
+    private void reapExpiredSessions() {
+        Instant cutoff = Instant.now().minus(Duration.ofMinutes(SESSION_TTL_MINUTES));
+
+        for (Map.Entry<Long, SessionEntry> entry : sessions.entrySet()) {
+            if (entry.getValue().lastUsed().isBefore(cutoff)) {
+                long threadId = entry.getKey();
+                SessionEntry session = sessions.remove(threadId);
+                if (session == null) continue; // already removed by another thread
+
+                log.info("Session expired — thread_id=" + threadId
+                    + " idle since " + session.lastUsed());
+
+                // Best-effort: summarize before evicting
+                try {
+                    String summary = summarizeSession(session.sessionId());
+                    if (summary != null && !summary.isBlank()) {
+                        brain.storeSessionSummary(threadId, config.nodeName, summary);
+                    }
+                } catch (Exception e) {
+                    log.warning("Failed to summarize session thread_id=" + threadId
+                        + ": " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Ask Claude to summarize the session before we discard it.
+     * Uses --resume to access the full conversation, then extracts the summary.
+     */
+    private String summarizeSession(String sessionId) {
+        try {
+            List<String> cmd = new ArrayList<>();
+            cmd.add(claudeBin);
+            cmd.add("-p");
+            cmd.add("--resume");
+            cmd.add(sessionId);
+            cmd.add("Summarize this conversation concisely in 2-3 sentences: key decisions, outcomes, and any pending items.");
+            cmd.add("--model");         cmd.add(MODEL);
+            cmd.add("--output-format"); cmd.add("json");
+            cmd.add("--dangerously-skip-permissions");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.environment().putAll(buildEnv());
+            Process proc = pb.start();
+
+            byte[] out = proc.getInputStream().readAllBytes();
+            boolean done = proc.waitFor(3, java.util.concurrent.TimeUnit.MINUTES);
+            if (!done) { proc.destroyForcibly(); return null; }
+
+            String stdout = new String(out, StandardCharsets.UTF_8).trim();
+            if (stdout.isEmpty()) return null;
+
+            try {
+                Json json = Json.parse(stdout);
+                String result = json.getString("result");
+                if (result != null) return result;
+            } catch (Exception ignored) {}
+
+            return stdout.length() > 1000 ? stdout.substring(0, 1000) : stdout;
+        } catch (Exception e) {
+            log.warning("Session summarize failed: " + e.getMessage());
+            return null;
+        }
     }
 
     /**
      * Build a ClaudeCliProcessor if the claude CLI is reachable, else null.
      * Caller falls through to the next processor option on null.
      */
-    public static MessageProcessor create(HttpClient http, PeerConfig config) {
+    public static MessageProcessor create(HttpClient http, PeerConfig config, OpenBrainStore brain) {
         String bin = findClaudeBin();
         if (bin == null) {
             log.warning("claude CLI not found — ClaudeCliProcessor unavailable");
@@ -67,7 +167,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
         }
         log.info("ClaudeCliProcessor active — bin=" + bin + " model=" + MODEL
             + " node=" + config.nodeName);
-        return new ClaudeCliProcessor(http, config, bin);
+        return new ClaudeCliProcessor(http, config, brain, bin);
     }
 
     @Override
@@ -82,24 +182,31 @@ public class ClaudeCliProcessor implements MessageProcessor {
     }
 
     private String runClaude(long threadId, String fromNode, String userContent) throws Exception {
-        String existingSession = sessions.get(threadId);
-
-        // Build system prompt for first message in this thread
-        String systemPrompt = "You are the " + config.nodeName
-            + " agent in a distributed multi-agent system. "
-            + "You are receiving a message from the " + fromNode + " agent. "
-            + "Respond helpfully and concisely. "
-            + "You have full tool access — use bash for any system commands requested.";
+        SessionEntry existing = sessions.get(threadId);
 
         List<String> cmd = new ArrayList<>();
         cmd.add(claudeBin);
         cmd.add("-p");
 
-        if (existingSession != null) {
+        if (existing != null) {
+            // Resume existing session — Claude has full context
             cmd.add("--resume");
-            cmd.add(existingSession);
+            cmd.add(existing.sessionId());
             cmd.add(userContent);
         } else {
+            // New session — build system prompt, check for prior context in OpenBrain
+            String systemPrompt = "You are the " + config.nodeName
+                + " agent in a distributed multi-agent system. "
+                + "You are receiving a message from the " + fromNode + " agent. "
+                + "Respond helpfully and concisely. "
+                + "You have full tool access — use bash for any system commands requested.";
+
+            String priorContext = brain.fetchSessionContext(threadId);
+            if (priorContext != null) {
+                systemPrompt += "\n\nPrevious conversation context:\n" + priorContext;
+                log.info("Loaded prior session context for thread_id=" + threadId);
+            }
+
             cmd.add(systemPrompt + "\n\n" + userContent);
         }
 
@@ -133,7 +240,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
             Json out = Json.parse(stdout);
             String sid = out.getString("session_id");
             if (sid != null) {
-                sessions.put(threadId, sid);
+                sessions.put(threadId, new SessionEntry(sid, Instant.now()));
                 log.fine("Session stored thread_id=" + threadId + " session=" + sid);
             }
             String result = out.getString("result");

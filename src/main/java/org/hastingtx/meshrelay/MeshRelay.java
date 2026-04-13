@@ -81,7 +81,7 @@ public class MeshRelay {
         // Processor selection — config.processor overrides auto-detection:
         //   "gemma"     → GemmaProcessor only (dedicated Ollama agent)
         //   "claude-cli"→ ClaudeCliProcessor only
-        //   null/absent → auto priority: ClaudeCliProcessor → GemmaProcessor → ClaudeProcessor
+        //   null/absent → auto priority: ClaudeCliProcessor → GemmaProcessor → logging
         MessageProcessor processor;
         if ("gemma".equals(config.processor)) {
             log.info("Processor forced to Gemma via config");
@@ -92,7 +92,7 @@ public class MeshRelay {
             }
         } else if ("claude-cli".equals(config.processor)) {
             log.info("Processor forced to Claude CLI via config");
-            processor = ClaudeCliProcessor.create(client, config);
+            processor = ClaudeCliProcessor.create(client, config, brain);
             if (processor == null) {
                 log.severe("processor=claude-cli requested but claude binary not found — exiting.");
                 System.exit(1);
@@ -102,7 +102,7 @@ public class MeshRelay {
             //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
             //   2. GemmaProcessor     — local Ollama, works without internet
             //   3. logging()          — safe no-op fallback
-            processor = ClaudeCliProcessor.create(client, config);
+            processor = ClaudeCliProcessor.create(client, config, brain);
             if (processor == null) processor = GemmaProcessor.create(client, config);
             if (processor == null) processor = MessageProcessor.logging();
         }

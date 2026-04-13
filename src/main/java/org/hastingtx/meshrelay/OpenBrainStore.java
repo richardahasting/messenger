@@ -202,6 +202,77 @@ public class OpenBrainStore {
     }
 
     /**
+     * Store a session summary in OpenBrain for later context restoration.
+     * Tagged so it can be retrieved by thread_id when a new session starts.
+     */
+    public void storeSessionSummary(long threadId, String nodeName, String summary) {
+        try {
+            String escaped = Json.escape(summary);
+            String body = """
+                {
+                  "tool": "capture_thought",
+                  "content": "%s",
+                  "category": "session-context",
+                  "project": "messenger",
+                  "node": "%s",
+                  "status": "active",
+                  "tags": ["thread:%d", "session-summary"],
+                  "source": "messenger-session"
+                }
+                """.formatted(escaped, nodeName, threadId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            client.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Session summary stored for thread_id=" + threadId);
+        } catch (Exception e) {
+            log.warning("Failed to store session summary for thread_id=" + threadId + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Fetch the most recent session summary for a thread from OpenBrain.
+     * Returns null if no prior context exists.
+     */
+    public String fetchSessionContext(long threadId) {
+        try {
+            String body = """
+                {
+                  "tool": "search_thoughts",
+                  "query": "thread:%d session-summary",
+                  "mode": "keyword",
+                  "limit": 1
+                }
+                """.formatted(threadId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) return null;
+
+            Json results = Json.parse(response.body());
+            if (!results.isArray() || results.size() == 0) return null;
+
+            return results.asList().get(0).getString("content");
+        } catch (Exception e) {
+            log.warning("Failed to fetch session context for thread_id=" + threadId + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * A pending message retrieved from OpenBrain.
      *
      * thoughtId — the OpenBrain thought/message id (used for markArchived)
