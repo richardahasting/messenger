@@ -145,6 +145,70 @@ public class OpenBrainStore {
     }
 
     /**
+     * Atomically claim a pending message before processing begins.
+     *
+     * Changes status from "active" to "claimed" so the message is invisible
+     * to subsequent polls even if markArchived() later fails. Without this,
+     * a failed or slow archival leaves the message "active" and the next poll
+     * re-processes it — causing duplicate delivery.
+     *
+     * Returns true if the claim was sent successfully, false on network error.
+     * A false return means the message should be skipped this cycle (it will
+     * be retried next poll while still "active").
+     */
+    public boolean claimMessage(int thoughtId) {
+        try {
+            String body = """
+                {"tool":"update_thought","id":%d,"status":"claimed"}
+                """.formatted(thoughtId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                log.warning("Failed to claim thought " + thoughtId + ": HTTP " + resp.statusCode());
+                return false;
+            }
+            log.fine("Claimed thought " + thoughtId);
+            return true;
+        } catch (Exception e) {
+            log.warning("Failed to claim thought " + thoughtId + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Reset a claimed message back to "active" so it will be retried next poll.
+     * Called when processing fails after a successful claim.
+     */
+    public void resetMessage(int thoughtId) {
+        try {
+            String body = """
+                {"tool":"update_thought","id":%d,"status":"active"}
+                """.formatted(thoughtId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            client.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Reset thought " + thoughtId + " to active for retry");
+        } catch (Exception e) {
+            log.warning("Failed to reset thought " + thoughtId + " to active: " + e.getMessage());
+        }
+    }
+
+    /**
      * Mark a thought as archived — signals "this message has been processed".
      * Called after the agent successfully handles a pending message.
      */

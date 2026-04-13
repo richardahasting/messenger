@@ -53,11 +53,14 @@ public class PeerConfig {
     public final int    claudeTimeoutMinutes;
     public final int    sessionTtlMinutes;
     public final int    reaperIntervalMinutes;
+    /** Optional personality/voice for this node's agent. Null for default. */
+    public final String personality;
 
     private PeerConfig(String nodeName, int listenPort, Map<String, String> peers,
                        String openBrainUrl, String openBrainKey, String source,
                        String processor, String claudeModel, int claudeTimeoutMinutes,
-                       int sessionTtlMinutes, int reaperIntervalMinutes) {
+                       int sessionTtlMinutes, int reaperIntervalMinutes,
+                       String personality) {
         this.nodeName              = nodeName;
         this.listenPort            = listenPort;
         this.peers                 = Collections.unmodifiableMap(peers);
@@ -69,6 +72,7 @@ public class PeerConfig {
         this.claudeTimeoutMinutes  = claudeTimeoutMinutes;
         this.sessionTtlMinutes     = sessionTtlMinutes;
         this.reaperIntervalMinutes = reaperIntervalMinutes;
+        this.personality           = personality;
     }
 
     /**
@@ -178,10 +182,11 @@ public class PeerConfig {
         int    claudeTimeoutMinutes = cfg.getInt("claude_timeout_minutes", 12);
         int    sessionTtlMinutes    = cfg.getInt("session_ttl_minutes", 240);
         int    reaperIntervalMinutes = cfg.getInt("reaper_interval_minutes", 5);
+        String personality          = cfg.getString("personality");
 
         return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source,
             processor, claudeModel, claudeTimeoutMinutes, sessionTtlMinutes,
-            reaperIntervalMinutes);
+            reaperIntervalMinutes, personality);
     }
 
     private static void writeCache(Path cacheFile, String content) {

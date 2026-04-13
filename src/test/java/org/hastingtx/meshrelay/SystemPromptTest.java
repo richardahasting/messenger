@@ -80,9 +80,8 @@ class SystemPromptTest {
         @Test
         void localProcessorHasToolAccess() {
             String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
-            assertTrue(prompt.contains("full local tool access"));
-            assertTrue(prompt.contains("Run shell commands"));
-            assertTrue(prompt.contains("Read, write, and edit files"));
+            assertTrue(prompt.contains("local tool access"));
+            assertTrue(prompt.contains("bash"));
             assertTrue(prompt.contains("MCP tools"));
         }
 
@@ -109,9 +108,9 @@ class SystemPromptTest {
         @Test
         void textOnlyProcessorNoToolAccess() {
             String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
-            assertTrue(prompt.contains("text-only responder"));
+            assertTrue(prompt.contains("Text-only"));
             assertTrue(prompt.contains("no local tool access"));
-            assertFalse(prompt.contains("full local tool access"));
+            assertFalse(prompt.contains("Full local tool access"));
         }
 
         @Test
@@ -125,6 +124,74 @@ class SystemPromptTest {
         void identityReflectsNode() {
             String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
             assertTrue(prompt.contains("**macmini**"));
+        }
+    }
+
+    @Nested
+    class Personality {
+
+        @Test
+        void linuxserverIsConservative() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("careful engineer"));
+            assertTrue(prompt.contains("question assumptions"));
+        }
+
+        @Test
+        void macminiIsRiskTaker() {
+            String prompt = buildTestPrompt("macmini", "linuxserver", 462, true);
+            assertTrue(prompt.contains("action"));
+            assertTrue(prompt.contains("risk"));
+        }
+
+        @Test
+        void macbookAirIsContrarian() {
+            String prompt = buildTestPrompt("macbook-air", "linuxserver", 462, true);
+            assertTrue(prompt.contains("contrarian"));
+            assertTrue(prompt.contains("tenth man"));
+        }
+
+        @Test
+        void unknownNodeGetsDefaultPersonality() {
+            String prompt = buildTestPrompt("unknown-node", "linuxserver", 462, true);
+            // The "Your Personality" section should have the default personality
+            assertTrue(prompt.contains("direct"));
+            // The node roles section still mentions all nodes' personalities
+            // but the agent's own personality should be the generic default
+            assertTrue(prompt.contains("no hand-holding"));
+        }
+
+        @Test
+        void personalitiesAreDifferent() {
+            String linux = buildTestPrompt("linuxserver", "macmini", 1, true);
+            String mac = buildTestPrompt("macmini", "linuxserver", 1, true);
+            String air = buildTestPrompt("macbook-air", "linuxserver", 1, true);
+            // Each should have unique personality text
+            assertFalse(linux.contains("ship it and iterate"));
+            assertTrue(mac.contains("ship it and iterate"));
+            assertTrue(air.contains("devil's advocate"));
+            assertFalse(linux.contains("devil's advocate"));
+        }
+
+        @Test
+        void promptEncouragesDisagreement() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("echo chamber"));
+            assertTrue(prompt.contains("Challenge"));
+        }
+
+        @Test
+        void promptMentionsHumor() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("Humor"));
+        }
+
+        @Test
+        void nodeRolesIncludePersonalityHints() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("conservative engineer"));
+            assertTrue(prompt.contains("pragmatic risk-taker"));
+            assertTrue(prompt.contains("contrarian"));
         }
     }
 

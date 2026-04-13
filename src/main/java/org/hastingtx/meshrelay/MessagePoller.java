@@ -191,16 +191,28 @@ public class MessagePoller implements Runnable {
         }
 
         try {
-            processor.process(msg);
-            brain.markArchived(msg.thoughtId());
-            totalProcessed++;
-            log.info("Processed message thread_id=" + threadId
-                + " from=" + msg.fromNode()
-                + " total_processed=" + totalProcessed);
-        } catch (Exception e) {
-            // Do NOT mark archived — message will be retried next poll
-            log.warning("Failed to process message thread_id=" + threadId
-                + ": " + e.getMessage() + " — will retry next poll");
+            // Claim the message before processing to prevent duplicate delivery.
+            // If OpenBrain is unavailable here, skip and retry next poll (still "active").
+            // Once claimed, subsequent polls won't see this message even if archiving later fails.
+            if (!brain.claimMessage(msg.thoughtId())) {
+                log.warning("Could not claim message thread_id=" + threadId
+                    + " thoughtId=" + msg.thoughtId() + " — skipping, will retry next poll");
+                return;
+            }
+
+            try {
+                processor.process(msg);
+                brain.markArchived(msg.thoughtId());
+                totalProcessed++;
+                log.info("Processed message thread_id=" + threadId
+                    + " from=" + msg.fromNode()
+                    + " total_processed=" + totalProcessed);
+            } catch (Exception e) {
+                // Processing failed after claiming — reset to "active" so it will be retried.
+                brain.resetMessage(msg.thoughtId());
+                log.warning("Failed to process message thread_id=" + threadId
+                    + ": " + e.getMessage() + " — reset to active, will retry next poll");
+            }
         } finally {
             lock.unlock();
             // Remove lock if no other thread is waiting on it
