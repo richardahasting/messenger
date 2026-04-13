@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hastingtx.messenger</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/java</string>
+        <string>-jar</string>
+        <string>/Users/richard/projects/messenger/target/messenger.jar</string>
+        <string>/Users/richard/projects/messenger/config.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/richard/projects/messenger</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OPENBRAIN_KEY</key>
+        <string>SET_ME</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/richard/logs/messenger.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/richard/logs/messenger.err</string>
+</dict>
+</plist>

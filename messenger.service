@@ -15,5 +15,10 @@ StandardError=journal
 # Pass OpenBrain key from environment
 EnvironmentFile=-/home/richard/projects/messenger/.env
 
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/richard
+
 [Install]
 WantedBy=multi-user.target
