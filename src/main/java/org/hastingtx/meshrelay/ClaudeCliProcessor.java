@@ -34,7 +34,7 @@ import java.util.logging.Logger;
  *
  * Session lifecycle:
  *   1. Active session — thread_id maps to a live Claude session_id (--resume)
- *   2. Expiry — session unused for SESSION_TTL_MINUTES is eligible for eviction
+ *   2. Expiry — session unused for sessionTtlMinutes is eligible for eviction
  *   3. Before eviction — summarize the conversation via Claude, store in OpenBrain
  *   4. New session for expired thread — load prior summary from OpenBrain as context
  *
@@ -45,10 +45,10 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
     private static final Logger log = Logger.getLogger(ClaudeCliProcessor.class.getName());
 
-    private static final String MODEL   = "claude-sonnet-4-6";
-    private static final int    TIMEOUT_MINUTES = 12;   // matches thread lock timeout
-    private static final int    SESSION_TTL_MINUTES = 45;
-    private static final int    REAPER_INTERVAL_MINUTES = 5;
+    private final String model;
+    private final int    timeoutMinutes;
+    private final int    sessionTtlMinutes;
+    private final int    reaperIntervalMinutes;
 
     /** Tracks a Claude session and when it was last used. */
     record SessionEntry(String sessionId, Instant lastUsed) {}
@@ -64,11 +64,15 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
     private ClaudeCliProcessor(HttpClient http, PeerConfig config,
                                 OpenBrainStore brain, String claudeBin) {
-        this.http      = http;
-        this.config    = config;
-        this.brain     = brain;
-        this.claudeBin = claudeBin;
-        this.relayUrl  = "http://localhost:" + config.listenPort + "/relay";
+        this.http                  = http;
+        this.config                = config;
+        this.brain                 = brain;
+        this.claudeBin             = claudeBin;
+        this.relayUrl              = "http://localhost:" + config.listenPort + "/relay";
+        this.model                 = config.claudeModel;
+        this.timeoutMinutes        = config.claudeTimeoutMinutes;
+        this.sessionTtlMinutes     = config.sessionTtlMinutes;
+        this.reaperIntervalMinutes = config.reaperIntervalMinutes;
         startSessionReaper();
     }
 
@@ -77,7 +81,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
         Thread.ofVirtual().name("session-reaper").start(() -> {
             while (true) {
                 try {
-                    Thread.sleep(Duration.ofMinutes(REAPER_INTERVAL_MINUTES));
+                    Thread.sleep(Duration.ofMinutes(reaperIntervalMinutes));
                     reapExpiredSessions();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -85,12 +89,12 @@ public class ClaudeCliProcessor implements MessageProcessor {
                 }
             }
         });
-        log.info("Session reaper started — TTL=" + SESSION_TTL_MINUTES + "m, check interval="
-            + REAPER_INTERVAL_MINUTES + "m");
+        log.info("Session reaper started — TTL=" + sessionTtlMinutes + "m, check interval="
+            + reaperIntervalMinutes + "m");
     }
 
     private void reapExpiredSessions() {
-        Instant cutoff = Instant.now().minus(Duration.ofMinutes(SESSION_TTL_MINUTES));
+        Instant cutoff = Instant.now().minus(Duration.ofMinutes(sessionTtlMinutes));
 
         for (Map.Entry<Long, SessionEntry> entry : sessions.entrySet()) {
             if (entry.getValue().lastUsed().isBefore(cutoff)) {
@@ -127,7 +131,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
             cmd.add("--resume");
             cmd.add(sessionId);
             cmd.add("Summarize this conversation concisely in 2-3 sentences: key decisions, outcomes, and any pending items.");
-            cmd.add("--model");         cmd.add(MODEL);
+            cmd.add("--model");         cmd.add(model);
             cmd.add("--output-format"); cmd.add("json");
             cmd.add("--dangerously-skip-permissions");
 
@@ -165,7 +169,9 @@ public class ClaudeCliProcessor implements MessageProcessor {
             log.warning("claude CLI not found — ClaudeCliProcessor unavailable");
             return null;
         }
-        log.info("ClaudeCliProcessor active — bin=" + bin + " model=" + MODEL
+        log.info("ClaudeCliProcessor active — bin=" + bin + " model=" + config.claudeModel
+            + " timeout=" + config.claudeTimeoutMinutes + "m"
+            + " sessionTTL=" + config.sessionTtlMinutes + "m"
             + " node=" + config.nodeName);
         return new ClaudeCliProcessor(http, config, brain, bin);
     }
@@ -210,7 +216,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
             cmd.add(systemPrompt + "\n\n" + userContent);
         }
 
-        cmd.add("--model");         cmd.add(MODEL);
+        cmd.add("--model");         cmd.add(model);
         cmd.add("--output-format"); cmd.add("json");
         cmd.add("--dangerously-skip-permissions");
 
@@ -224,10 +230,10 @@ public class ClaudeCliProcessor implements MessageProcessor {
         byte[] stdoutBytes = proc.getInputStream().readAllBytes();
         String stdout = new String(stdoutBytes, StandardCharsets.UTF_8).trim();
 
-        boolean finished = proc.waitFor(TIMEOUT_MINUTES, java.util.concurrent.TimeUnit.MINUTES);
+        boolean finished = proc.waitFor(timeoutMinutes, java.util.concurrent.TimeUnit.MINUTES);
         if (!finished) {
             proc.destroyForcibly();
-            throw new Exception("claude CLI timed out after " + TIMEOUT_MINUTES + "m");
+            throw new Exception("claude CLI timed out after " + timeoutMinutes + "m");
         }
 
         return parseCliOutput(stdout, threadId);

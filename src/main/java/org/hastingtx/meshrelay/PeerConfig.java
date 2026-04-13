@@ -48,16 +48,27 @@ public class PeerConfig {
     /** Optional processor override: "gemma" | "claude-cli" | null (auto). */
     public final String processor;
 
+    // ── Claude CLI processor settings (configurable, with defaults) ───────
+    public final String claudeModel;
+    public final int    claudeTimeoutMinutes;
+    public final int    sessionTtlMinutes;
+    public final int    reaperIntervalMinutes;
+
     private PeerConfig(String nodeName, int listenPort, Map<String, String> peers,
                        String openBrainUrl, String openBrainKey, String source,
-                       String processor) {
-        this.nodeName     = nodeName;
-        this.listenPort   = listenPort;
-        this.peers        = Collections.unmodifiableMap(peers);
-        this.openBrainUrl = openBrainUrl;
-        this.openBrainKey = openBrainKey;
-        this.source       = source;
-        this.processor    = processor;
+                       String processor, String claudeModel, int claudeTimeoutMinutes,
+                       int sessionTtlMinutes, int reaperIntervalMinutes) {
+        this.nodeName              = nodeName;
+        this.listenPort            = listenPort;
+        this.peers                 = Collections.unmodifiableMap(peers);
+        this.openBrainUrl          = openBrainUrl;
+        this.openBrainKey          = openBrainKey;
+        this.source                = source;
+        this.processor             = processor;
+        this.claudeModel           = claudeModel;
+        this.claudeTimeoutMinutes  = claudeTimeoutMinutes;
+        this.sessionTtlMinutes     = sessionTtlMinutes;
+        this.reaperIntervalMinutes = reaperIntervalMinutes;
     }
 
     /**
@@ -163,7 +174,14 @@ public class PeerConfig {
 
         String processor = cfg.getString("processor");
 
-        return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source, processor);
+        String claudeModel          = cfg.getString("claude_model", "claude-sonnet-4-6");
+        int    claudeTimeoutMinutes = cfg.getInt("claude_timeout_minutes", 12);
+        int    sessionTtlMinutes    = cfg.getInt("session_ttl_minutes", 240);
+        int    reaperIntervalMinutes = cfg.getInt("reaper_interval_minutes", 5);
+
+        return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source,
+            processor, claudeModel, claudeTimeoutMinutes, sessionTtlMinutes,
+            reaperIntervalMinutes);
     }
 
     private static void writeCache(Path cacheFile, String content) {
@@ -183,6 +201,10 @@ public class PeerConfig {
     public String toString() {
         return "PeerConfig{node=" + nodeName + ", port=" + listenPort
             + ", peers=" + peers.keySet() + ", source=" + source
-            + (processor != null ? ", processor=" + processor : "") + "}";
+            + (processor != null ? ", processor=" + processor : "")
+            + ", claudeModel=" + claudeModel
+            + ", timeout=" + claudeTimeoutMinutes + "m"
+            + ", sessionTTL=" + sessionTtlMinutes + "m"
+            + ", reaperInterval=" + reaperIntervalMinutes + "m}";
     }
 }

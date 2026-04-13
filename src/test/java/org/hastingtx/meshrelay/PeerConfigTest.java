@@ -98,4 +98,85 @@ class PeerConfigTest {
         Json cfg = Json.parse(json);
         assertTrue(cfg.get("peers").asList().isEmpty());
     }
+
+    // ── Claude CLI processor settings ────────────────────────────────────
+
+    @Test
+    void claudeModelDefault() {
+        String json = "{\"node_name\":\"test\"}";
+        Json cfg = Json.parse(json);
+        assertEquals("claude-sonnet-4-6", cfg.getString("claude_model", "claude-sonnet-4-6"));
+    }
+
+    @Test
+    void claudeModelOverride() {
+        String json = "{\"node_name\":\"test\",\"claude_model\":\"claude-opus-4-6\"}";
+        Json cfg = Json.parse(json);
+        assertEquals("claude-opus-4-6", cfg.getString("claude_model", "claude-sonnet-4-6"));
+    }
+
+    @Test
+    void claudeTimeoutDefault() {
+        String json = "{\"node_name\":\"test\"}";
+        Json cfg = Json.parse(json);
+        assertEquals(12, cfg.getInt("claude_timeout_minutes", 12));
+    }
+
+    @Test
+    void claudeTimeoutOverride() {
+        String json = "{\"node_name\":\"test\",\"claude_timeout_minutes\":20}";
+        Json cfg = Json.parse(json);
+        assertEquals(20, cfg.getInt("claude_timeout_minutes", 12));
+    }
+
+    @Test
+    void sessionTtlDefault() {
+        String json = "{\"node_name\":\"test\"}";
+        Json cfg = Json.parse(json);
+        assertEquals(240, cfg.getInt("session_ttl_minutes", 240));
+    }
+
+    @Test
+    void sessionTtlOverride() {
+        String json = "{\"node_name\":\"test\",\"session_ttl_minutes\":60}";
+        Json cfg = Json.parse(json);
+        assertEquals(60, cfg.getInt("session_ttl_minutes", 240));
+    }
+
+    @Test
+    void reaperIntervalDefault() {
+        String json = "{\"node_name\":\"test\"}";
+        Json cfg = Json.parse(json);
+        assertEquals(5, cfg.getInt("reaper_interval_minutes", 5));
+    }
+
+    @Test
+    void reaperIntervalOverride() {
+        String json = "{\"node_name\":\"test\",\"reaper_interval_minutes\":10}";
+        Json cfg = Json.parse(json);
+        assertEquals(10, cfg.getInt("reaper_interval_minutes", 5));
+    }
+
+    @Test
+    void fullConfigWithAllSettings() {
+        String json = """
+            {
+              "node_name": "macmini",
+              "listen_port": 13007,
+              "processor": "claude-cli",
+              "claude_model": "claude-opus-4-6",
+              "claude_timeout_minutes": 15,
+              "session_ttl_minutes": 120,
+              "reaper_interval_minutes": 10,
+              "peers": [{"name": "linuxserver", "url": "http://192.168.0.225:13007"}]
+            }
+            """;
+        Json cfg = Json.parse(json);
+        assertEquals("macmini", cfg.getString("node_name"));
+        assertEquals("claude-cli", cfg.getString("processor"));
+        assertEquals("claude-opus-4-6", cfg.getString("claude_model", "claude-sonnet-4-6"));
+        assertEquals(15, cfg.getInt("claude_timeout_minutes", 12));
+        assertEquals(120, cfg.getInt("session_ttl_minutes", 240));
+        assertEquals(10, cfg.getInt("reaper_interval_minutes", 5));
+    }
 }
