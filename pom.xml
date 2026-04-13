@@ -18,10 +18,24 @@
         <mainClass>org.hastingtx.meshrelay.MeshRelay</mainClass>
     </properties>
 
-    <!-- Zero external dependencies — JDK only -->
+    <!-- Zero external runtime dependencies — JDK only -->
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.3</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>
+            <!-- JUnit 5 requires surefire 3.x -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
             <!-- Fat JAR: java -jar messenger.jar -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
