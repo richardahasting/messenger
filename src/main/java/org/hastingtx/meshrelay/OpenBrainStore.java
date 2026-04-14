@@ -24,9 +24,12 @@ import java.util.logging.Logger;
  * If processing fails after markDelivered(), the message stays in "delivered"
  * state and will not be retried automatically. See MessagePoller for details.
  *
- * BLOCKED: storeMessage() calls send_message, which is currently returning None
- * on macmini (server-side serialization bug — thought #701). Do not integrate
- * until macmini confirms a working return envelope {id, thread_id}.
+ * FIXED (2026-04-13): send_message previously returned None on macmini due to a
+ * PostgreSQL CTE snapshot-isolation bug in tools/messaging.py. The outer UPDATE
+ * in the CTE could not see the just-inserted row, so fetchrow() returned None and
+ * row["id"] raised TypeError. Fixed by replacing the CTE with two separate
+ * statements inside an explicit asyncpg transaction. Service redeployed on macmini.
+ * storeMessage() now receives the correct {id, thread_id} envelope.
  */
 public class OpenBrainStore {
 
@@ -55,20 +58,38 @@ public class OpenBrainStore {
      *   thread_id — the conversation thread (used for wake-up pings and
      *               per-thread serialization in MessagePoller)
      *
+     * When threadId >= 0, the message is stored as a reply in that thread.
+     * If OpenBrain rejects the thread_id (FK violation — stale/phantom thread),
+     * the method automatically retries without thread_id to start a new thread.
+     * This makes reply delivery robust to thread table gaps.
+     *
      * @throws Exception if OpenBrain is unreachable, returns a non-200 status,
      *         or returns a malformed envelope (the currently-broken None case).
      *         Callers should treat this as a hard failure — no StoreResult means
      *         the wake-up cannot be sent either.
      */
     public StoreResult storeMessage(String fromNode, String toNode, String content) throws Exception {
+        return storeMessage(fromNode, toNode, content, -1L);
+    }
+
+    /**
+     * Store a mesh message in an existing thread. If threadId < 0, a new thread is started.
+     * Automatically falls back to a new thread if the given threadId is rejected by OpenBrain.
+     */
+    public StoreResult storeMessage(String fromNode, String toNode, String content,
+                                    long threadId) throws Exception {
+        String threadField = threadId > 0
+            ? ",\n  \"thread_id\": " + threadId
+            : "";
+
         String body = """
             {
               "tool": "send_message",
               "from_node": "%s",
               "to_node": "%s",
-              "content": "%s"
+              "content": "%s"%s
             }
-            """.formatted(fromNode, toNode, Json.escape(content));
+            """.formatted(fromNode, toNode, Json.escape(content), threadField);
 
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create(mcpUrl))
@@ -81,27 +102,35 @@ public class OpenBrainStore {
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() != 200) {
+            // If the caller supplied a thread_id and OpenBrain rejected it (FK violation on a
+            // phantom/stale thread), retry once as a new thread rather than failing hard.
+            if (threadId >= 0) {
+                log.warning("send_message with thread_id=" + threadId + " rejected (HTTP "
+                    + response.statusCode() + ") — retrying as new thread. Body: "
+                    + response.body().substring(0, Math.min(200, response.body().length())));
+                return storeMessage(fromNode, toNode, content, -1L);
+            }
             throw new Exception("OpenBrain send_message returned HTTP " + response.statusCode()
                 + ": " + response.body());
         }
 
-        Json result   = Json.parse(response.body());
-        int  messageId = result.getInt("id", -1);
-        long threadId  = result.getLong("thread_id", -1L);
+        Json result      = Json.parse(response.body());
+        int  messageId   = result.getInt("id", -1);
+        long assignedThread = result.getLong("thread_id", -1L);
 
         if (messageId < 0) {
             // This is the currently-broken case: server returns None → parser sees no "id".
             throw new Exception("send_message response missing 'id' field — server returned: "
                 + response.body());
         }
-        if (threadId < 0) {
+        if (assignedThread <= 0) {
             throw new Exception("send_message response missing 'thread_id' field — server returned: "
                 + response.body());
         }
 
         log.info("Message stored in OpenBrain: message_id=" + messageId
-            + " thread_id=" + threadId + " to=" + toNode + " from=" + fromNode);
-        return new StoreResult(messageId, threadId);
+            + " thread_id=" + assignedThread + " to=" + toNode + " from=" + fromNode);
+        return new StoreResult(messageId, assignedThread);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -244,6 +273,39 @@ public class OpenBrainStore {
             log.fine("Marked message " + messageId + " as archived");
         } catch (Exception e) {
             log.warning("Failed to archive message " + messageId + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Advance this node's broadcast watermark past the given message id.
+     *
+     * For broadcast messages (to_node="all"), get_inbox uses a per-node
+     * watermark — not the row status — to decide what's "new". Calling
+     * markArchived() on a broadcast row changes the shared row status but
+     * does NOT advance the watermark, so the message keeps re-appearing on
+     * every poll. This method fixes that.
+     *
+     * Must be called after successfully processing any message with toNode=="all".
+     */
+    public void updateBroadcastWatermark(String nodeName, int messageId) {
+        try {
+            String body = """
+                {"tool":"update_broadcast_watermark","node":"%s","last_seen_id":%d}
+                """.formatted(nodeName, messageId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            client.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Broadcast watermark advanced: node=" + nodeName + " last_seen_id=" + messageId);
+        } catch (Exception e) {
+            log.warning("Failed to update broadcast watermark for message_id=" + messageId
+                + ": " + e.getMessage());
         }
     }
 

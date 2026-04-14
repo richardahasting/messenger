@@ -255,6 +255,9 @@ public class MessagePoller implements Runnable {
             try {
                 processor.process(msg);
                 brain.markArchived(msg.messageId());
+                if ("all".equals(msg.toNode())) {
+                    brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                }
                 recordProcessed(msg.fromNode());
                 totalProcessed++;
                 log.info("Processed message thread_id=" + threadId

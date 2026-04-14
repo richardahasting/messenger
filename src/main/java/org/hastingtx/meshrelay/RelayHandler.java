@@ -80,6 +80,7 @@ public class RelayHandler implements HttpHandler {
         String toNode   = json.getString("to");
         String fromNode = json.getString("from");
         String content  = json.getString("content");
+        long   threadId = json.getLong("thread_id", -1L);
 
         if (toNode == null || toNode.isBlank()) {
             sendError(exchange, 400, "Missing required field: 'to'");
@@ -104,7 +105,7 @@ public class RelayHandler implements HttpHandler {
         // we cannot guarantee delivery and must return an error.
         OpenBrainStore.StoreResult stored;
         try {
-            stored = brain.storeMessage(fromNode, toNode, content);
+            stored = brain.storeMessage(fromNode, toNode, content, threadId);
         } catch (Exception e) {
             log.severe("Failed to store message in OpenBrain: " + e.getMessage());
             sendError(exchange, 503, "message_store_unavailable");
