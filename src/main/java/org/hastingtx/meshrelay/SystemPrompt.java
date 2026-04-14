@@ -57,6 +57,12 @@ public class SystemPrompt {
      */
     public static String build(PeerConfig config, String fromNode,
                                 long threadId, boolean isLocal) {
+        // Gemma and other text-only models get a minimal, tightly constrained prompt.
+        // The full prompt gives small models too many ideas.
+        if (!isLocal) {
+            return buildConstrained(config, fromNode, threadId);
+        }
+
         StringBuilder sb = new StringBuilder();
 
         // ── Identity + Personality ───────────────────────────────────────
@@ -167,6 +173,25 @@ public class SystemPrompt {
             case "macbook-air" -> PERSONALITY_MACBOOK_AIR;
             default            -> PERSONALITY_DEFAULT;
         };
+    }
+
+    /**
+     * Constrained prompt for text-only models (Gemma, etc).
+     * No mesh topology, no OpenBrain docs, no tool references.
+     * Strictly: answer what was asked, then stop.
+     */
+    private static String buildConstrained(PeerConfig config, String fromNode, long threadId) {
+        return "You are " + config.nodeName + ", a text-only assistant on a local network. "
+            + "You received a message from " + fromNode + " (thread #" + threadId + ").\n\n"
+            + "RULES:\n"
+            + "- Answer ONLY what was asked. Nothing more.\n"
+            + "- Do NOT ask follow-up questions.\n"
+            + "- Do NOT suggest next steps or additional tasks.\n"
+            + "- Do NOT volunteer to help with other things.\n"
+            + "- Do NOT initiate new topics or request information.\n"
+            + "- If you don't know the answer, say \"I don't know.\"\n"
+            + "- Keep responses under 200 words.\n"
+            + "- Be direct and technical.\n";
     }
 
     /** Build the prompt used to summarize a session before eviction. */

@@ -106,24 +106,45 @@ class SystemPromptTest {
     class TextOnlyProcessor {
 
         @Test
-        void textOnlyProcessorNoToolAccess() {
+        void textOnlyIsConstrained() {
             String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
-            assertTrue(prompt.contains("Text-only"));
-            assertTrue(prompt.contains("no local tool access"));
-            assertFalse(prompt.contains("Full local tool access"));
+            assertTrue(prompt.contains("RULES:"));
+            assertTrue(prompt.contains("ONLY what was asked"));
+            assertTrue(prompt.contains("Do NOT ask follow-up"));
+            assertTrue(prompt.contains("Do NOT suggest next steps"));
         }
 
         @Test
-        void textOnlyStillHasMeshContext() {
+        void textOnlyHasNoMeshContext() {
             String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
-            assertTrue(prompt.contains("## Mesh Network"));
-            assertTrue(prompt.contains("## OpenBrain"));
+            assertFalse(prompt.contains("## Mesh Network"));
+            assertFalse(prompt.contains("## OpenBrain"));
+            assertFalse(prompt.contains("browse_thoughts"));
         }
 
         @Test
-        void identityReflectsNode() {
+        void textOnlyHasNoPersonality() {
             String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
-            assertTrue(prompt.contains("**macmini**"));
+            assertFalse(prompt.contains("## Your Personality"));
+            assertFalse(prompt.contains("echo chamber"));
+        }
+
+        @Test
+        void textOnlyIdentifiesNodeAndSender() {
+            String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
+            assertTrue(prompt.contains("macmini"));
+            assertTrue(prompt.contains("linuxserver"));
+            assertTrue(prompt.contains("thread #500"));
+        }
+
+        @Test
+        void textOnlyIsShort() {
+            String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
+            // Constrained prompt should be much shorter than the full one
+            String fullPrompt = buildTestPrompt("macmini", "linuxserver", 500, true);
+            assertTrue(prompt.length() < fullPrompt.length() / 2,
+                "Constrained prompt (" + prompt.length() + " chars) should be less than half "
+                + "the full prompt (" + fullPrompt.length() + " chars)");
         }
     }
 
