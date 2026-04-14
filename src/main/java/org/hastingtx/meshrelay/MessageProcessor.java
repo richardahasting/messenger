@@ -21,7 +21,7 @@ public interface MessageProcessor {
     static MessageProcessor logging() {
         return msg -> {
             System.out.printf("[MessageProcessor] thread_id=%d from=%s content=%s%n",
-                msg.thoughtId(), msg.fromNode(),
+                msg.threadId(), msg.fromNode(),
                 msg.content().length() > 120
                     ? msg.content().substring(0, 120) + "…"
                     : msg.content());

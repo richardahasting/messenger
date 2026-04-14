@@ -102,9 +102,9 @@ public class RelayHandler implements HttpHandler {
         // --- Step 1: Store full message in OpenBrain ---
         // This is the only hard failure point. If OpenBrain is unreachable,
         // we cannot guarantee delivery and must return an error.
-        int threadId;
+        OpenBrainStore.StoreResult stored;
         try {
-            threadId = brain.storeMessage(fromNode, toNode, content);
+            stored = brain.storeMessage(fromNode, toNode, content);
         } catch (Exception e) {
             log.severe("Failed to store message in OpenBrain: " + e.getMessage());
             sendError(exchange, 503, "message_store_unavailable");
@@ -113,12 +113,12 @@ public class RelayHandler implements HttpHandler {
 
         // --- Step 2: Send wake-up ping to peer ---
         // Best-effort with retries. Failure here is NOT a delivery failure.
-        boolean wakeupSent = sendWakeup(toNode, targetUrl, fromNode, threadId);
+        boolean wakeupSent = sendWakeup(toNode, targetUrl, fromNode, stored.threadId());
 
         // --- Step 3: Respond to caller ---
         String response = """
-            {"thread_id":%d,"stored":true,"wakeup_sent":%b}
-            """.formatted(threadId, wakeupSent).trim();
+            {"thread_id":%d,"message_id":%d,"stored":true,"wakeup_sent":%b}
+            """.formatted(stored.threadId(), stored.messageId(), wakeupSent).trim();
 
         byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -137,7 +137,7 @@ public class RelayHandler implements HttpHandler {
      * Returns true if any attempt succeeded, false if all failed.
      */
     private boolean sendWakeup(String peerName, String peerBaseUrl,
-                                String fromNode, int threadId) {
+                                String fromNode, long threadId) {
         String endpoint = peerBaseUrl + "/wake";
         String ping = """
             {"from":"%s","thread_id":%d}

@@ -45,6 +45,7 @@ public class HealthHandler implements HttpHandler {
               "peers": %s,
               "jvm_threads": %d,
               "last_poll": "%s",
+              "poll_interval_seconds": %d,
               "messages_processed": %d
             }
             """.formatted(
@@ -53,6 +54,7 @@ public class HealthHandler implements HttpHandler {
                 peerList(),
                 ManagementFactory.getThreadMXBean().getThreadCount(),
                 lastPoll,
+                MessagePoller.POLL_INTERVAL.toSeconds(),
                 poller.getTotalProcessed()
             );
 

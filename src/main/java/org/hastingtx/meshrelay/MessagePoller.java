@@ -36,7 +36,7 @@ import java.util.logging.Logger;
 public class MessagePoller implements Runnable {
 
     private static final Logger   log           = Logger.getLogger(MessagePoller.class.getName());
-    private static final Duration POLL_INTERVAL = Duration.ofMinutes(10);
+    static final Duration POLL_INTERVAL = Duration.ofMinutes(10);
 
     private final PeerConfig       config;
     private final OpenBrainStore   brain;
@@ -175,7 +175,7 @@ public class MessagePoller implements Runnable {
                 log.warning("Rate limited sender=" + msg.fromNode()
                     + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
                     + " — archiving thread_id=" + msg.threadId() + " without processing");
-                brain.markArchived(msg.thoughtId());
+                brain.markArchived(msg.messageId());
                 continue;
             }
             processWithThreadLock(msg);
@@ -238,25 +238,44 @@ public class MessagePoller implements Runnable {
             // Claim the message before processing to prevent duplicate delivery.
             // If OpenBrain is unavailable here, skip and retry next poll (still "active").
             // Once claimed, subsequent polls won't see this message even if archiving later fails.
-            if (!brain.claimMessage(msg.thoughtId())) {
-                log.warning("Could not claim message thread_id=" + threadId
-                    + " thoughtId=" + msg.thoughtId() + " — skipping, will retry next poll");
+            // Mark delivered (pending → delivered) before processing.
+            // This is the atomic "claim" step — prevents duplicate delivery if
+            // the poll runs again before we finish.
+            //
+            // NOTE: unlike the old claimMessage/resetMessage pair, the messages
+            // table has no "reset to pending" operation. If processing fails after
+            // markDelivered(), the message stays in "delivered" state and will NOT
+            // be retried by the normal poll path. Manual recovery would be needed.
+            if (!brain.markDelivered(msg.messageId())) {
+                log.warning("Could not mark message delivered thread_id=" + threadId
+                    + " messageId=" + msg.messageId() + " — skipping, will retry next poll");
                 return;
             }
 
             try {
                 processor.process(msg);
-                brain.markArchived(msg.thoughtId());
+                brain.markArchived(msg.messageId());
                 recordProcessed(msg.fromNode());
                 totalProcessed++;
                 log.info("Processed message thread_id=" + threadId
                     + " from=" + msg.fromNode()
                     + " total_processed=" + totalProcessed);
             } catch (Exception e) {
-                // Processing failed after claiming — reset to "active" so it will be retried.
-                brain.resetMessage(msg.thoughtId());
                 log.warning("Failed to process message thread_id=" + threadId
-                    + ": " + e.getMessage() + " — reset to active, will retry next poll");
+                    + " messageId=" + msg.messageId() + ": " + e.getMessage());
+                // Attempt to reset to pending so the message can be retried.
+                // resetDelivered() is a stub — always returns false until macmini
+                // adds mark_pending to the OpenBrain MCP API (see OpenBrainStore).
+                if (!brain.resetDelivered(msg.messageId())) {
+                    // Reset unavailable — dead-letter: archive to clear "delivered"
+                    // limbo, then log to OpenBrain for auditability.
+                    log.warning("Reset unavailable — archiving as dead-letter:"
+                        + " thread_id=" + threadId + " messageId=" + msg.messageId());
+                    brain.markArchived(msg.messageId());
+                    brain.storeDeadLetter(msg, e.getMessage());
+                }
+                // If reset succeeded, message returns to pending and will be
+                // retried on the next poll cycle.
             }
         } finally {
             lock.unlock();

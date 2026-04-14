@@ -9,15 +9,24 @@ import java.time.Duration;
 import java.util.logging.Logger;
 
 /**
- * Writes mesh messages to OpenBrain as thoughts.
+ * Writes and reads mesh messages via the OpenBrain messages table.
  *
- * Uses the OpenBrain legacy simple API format:
- *   POST /mcp  {tool: "capture_thought", content: "...", tags: [...], ...}
+ * Uses the OpenBrain MCP HTTP API:
+ *   POST /mcp  {tool: "send_message"|"get_inbox"|"mark_delivered"|"mark_archived", ...}
  *   Header: x-brain-key: <key>
  *
- * Returns the thought ID, which becomes the thread_id in the wake-up notification.
- * The full message content lives in OpenBrain permanently — the relay only
- * carries the thread_id from this point on.
+ * Migration note: this class was previously backed by the thoughts table
+ * (capture_thought / browse_thoughts / update_thought). It now uses the
+ * purpose-built messages table, which provides native thread_id tracking,
+ * inbox-style retrieval, and proper delivery state.
+ *
+ * KNOWN LIMITATION: there is no "reset to pending" in the messages table API.
+ * If processing fails after markDelivered(), the message stays in "delivered"
+ * state and will not be retried automatically. See MessagePoller for details.
+ *
+ * BLOCKED: storeMessage() calls send_message, which is currently returning None
+ * on macmini (server-side serialization bug — thought #701). Do not integrate
+ * until macmini confirms a working return envelope {id, thread_id}.
  */
 public class OpenBrainStore {
 
@@ -34,22 +43,32 @@ public class OpenBrainStore {
         this.brainKey = config.openBrainKey;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Sending
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Store a mesh message as a thought and return its ID (thread_id).
+     * Store a mesh message via the messages table and return both IDs.
      *
-     * The thought is tagged so the recipient can find it:
-     *   tags:     ["to:<toNode>", "from:<fromNode>", "mesh-message"]
-     *   category: relationship
-     *   project:  mesh-messages
-     *   status:   active  ← unread; recipient sets to archived when processed
-     *   node:     <fromNode>
+     * Calls send_message which should return {id, thread_id}:
+     *   id        — the row id used for mark_delivered / mark_archived
+     *   thread_id — the conversation thread (used for wake-up pings and
+     *               per-thread serialization in MessagePoller)
      *
-     * @throws Exception if OpenBrain is unreachable or returns an error.
-     *         Callers should treat this as a hard failure — no thread_id means
+     * @throws Exception if OpenBrain is unreachable, returns a non-200 status,
+     *         or returns a malformed envelope (the currently-broken None case).
+     *         Callers should treat this as a hard failure — no StoreResult means
      *         the wake-up cannot be sent either.
      */
-    public int storeMessage(String fromNode, String toNode, String content) throws Exception {
-        String body = buildCaptureJson(fromNode, toNode, content);
+    public StoreResult storeMessage(String fromNode, String toNode, String content) throws Exception {
+        String body = """
+            {
+              "tool": "send_message",
+              "from_node": "%s",
+              "to_node": "%s",
+              "content": "%s"
+            }
+            """.formatted(fromNode, toNode, Json.escape(content));
 
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create(mcpUrl))
@@ -62,60 +81,53 @@ public class OpenBrainStore {
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() != 200) {
-            throw new Exception("OpenBrain returned HTTP " + response.statusCode()
+            throw new Exception("OpenBrain send_message returned HTTP " + response.statusCode()
                 + ": " + response.body());
         }
 
-        int id = Json.parse(response.body()).getInt("id", -1);
-        if (id < 0) {
-            throw new Exception("OpenBrain response missing 'id' field: " + response.body());
+        Json result   = Json.parse(response.body());
+        int  messageId = result.getInt("id", -1);
+        long threadId  = result.getLong("thread_id", -1L);
+
+        if (messageId < 0) {
+            // This is the currently-broken case: server returns None → parser sees no "id".
+            throw new Exception("send_message response missing 'id' field — server returned: "
+                + response.body());
+        }
+        if (threadId < 0) {
+            throw new Exception("send_message response missing 'thread_id' field — server returned: "
+                + response.body());
         }
 
-        log.info("Message stored in OpenBrain: thread_id=" + id
-            + " to=" + toNode + " from=" + fromNode);
-        return id;
+        log.info("Message stored in OpenBrain: message_id=" + messageId
+            + " thread_id=" + threadId + " to=" + toNode + " from=" + fromNode);
+        return new StoreResult(messageId, threadId);
     }
 
-    /** Build the JSON body for capture_thought using the legacy simple format. */
-    private String buildCaptureJson(String fromNode, String toNode, String content) {
-        String escaped = Json.escape(content);
-
-        return """
-            {
-              "tool": "capture_thought",
-              "content": "%s",
-              "category": "relationship",
-              "project": "mesh-messages",
-              "node": "%s",
-              "status": "active",
-              "tags": ["to:%s", "from:%s", "mesh-message"],
-              "source": "mesh-relay"
-            }
-            """.formatted(escaped, fromNode, toNode, fromNode);
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // Receiving
+    // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Query OpenBrain for all pending messages addressed to this node.
      *
-     * Searches for thoughts with:
-     *   project: mesh-messages
-     *   status:  active
-     *   tags:    ["to:<nodeName>"] OR ["to:all"]  (broadcasts included)
+     * Uses get_inbox which returns direct messages plus unread broadcasts.
+     * Server-side filtering replaces the client-side tag scan used with
+     * the thoughts table.
      *
-     * Returns a list of pending messages, oldest first.
+     * Returns an empty list (never throws) so a temporary OpenBrain outage
+     * just pauses delivery without crashing the polling loop.
      */
     public java.util.List<PendingMessage> pollPendingMessages(String nodeName) {
-        // browse_thoughts does pure SQL filtering — no text search, no false misses.
-        // We fetch all active mesh-messages and filter by to:nodeName / to:all client-side.
         try {
             String body = """
                 {
-                  "tool": "browse_thoughts",
-                  "project": "mesh-messages",
-                  "status": "active",
+                  "tool": "get_inbox",
+                  "node": "%s",
+                  "include_broadcasts": true,
                   "limit": 50
                 }
-                """;
+                """.formatted(nodeName);
 
             HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(mcpUrl))
@@ -129,14 +141,11 @@ public class OpenBrainStore {
                 request, HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() != 200) {
-                log.warning("OpenBrain poll returned HTTP " + response.statusCode());
+                log.warning("OpenBrain get_inbox returned HTTP " + response.statusCode());
                 return java.util.List.of();
             }
 
-            // Filter client-side: keep only messages addressed to this node or broadcast
-            return parseMessages(response.body()).stream()
-                .filter(m -> m.toNode().equals(nodeName) || m.toNode().equals("all"))
-                .collect(java.util.stream.Collectors.toList());
+            return parseInboxMessages(response.body());
 
         } catch (Exception e) {
             log.warning("OpenBrain poll failed: " + e.getMessage());
@@ -145,22 +154,24 @@ public class OpenBrainStore {
     }
 
     /**
-     * Atomically claim a pending message before processing begins.
+     * Mark a message as delivered (pending → delivered) before processing begins.
      *
-     * Changes status from "active" to "claimed" so the message is invisible
-     * to subsequent polls even if markArchived() later fails. Without this,
-     * a failed or slow archival leaves the message "active" and the next poll
-     * re-processes it — causing duplicate delivery.
+     * This is the atomic "claim" step — once delivered, subsequent get_inbox
+     * calls will not return this message, preventing duplicate processing.
      *
-     * Returns true if the claim was sent successfully, false on network error.
-     * A false return means the message should be skipped this cycle (it will
-     * be retried next poll while still "active").
+     * NOTE: Unlike the previous claimMessage() / resetMessage() pair, the
+     * messages table has no "reset to pending" operation. If processing fails
+     * after markDelivered(), the message stays in "delivered" state. See
+     * MessagePoller for how this case is handled.
+     *
+     * Returns true if the server accepted the update, false on network error.
+     * A false return means the message should be skipped this cycle.
      */
-    public boolean claimMessage(int thoughtId) {
+    public boolean markDelivered(int messageId) {
         try {
             String body = """
-                {"tool":"update_thought","id":%d,"status":"claimed"}
-                """.formatted(thoughtId);
+                {"tool":"mark_delivered","message_id":%d}
+                """.formatted(messageId);
 
             HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(mcpUrl))
@@ -172,51 +183,54 @@ public class OpenBrainStore {
 
             HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
-                log.warning("Failed to claim thought " + thoughtId + ": HTTP " + resp.statusCode());
+                log.warning("Failed to mark message " + messageId + " delivered: HTTP " + resp.statusCode());
                 return false;
             }
-            log.fine("Claimed thought " + thoughtId);
+            log.fine("Marked message " + messageId + " as delivered");
             return true;
         } catch (Exception e) {
-            log.warning("Failed to claim thought " + thoughtId + ": " + e.getMessage());
+            log.warning("Failed to mark message " + messageId + " delivered: " + e.getMessage());
             return false;
         }
     }
 
     /**
-     * Reset a claimed message back to "active" so it will be retried next poll.
-     * Called when processing fails after a successful claim.
+     * Reset a "delivered" message back to "pending" for retry.
+     *
+     * NOT IMPLEMENTED — the OpenBrain messages API has no mark_pending operation.
+     * This stub documents the required capability and owns the correct call site.
+     * When macmini adds mark_pending to the OpenBrain MCP, replace the body with:
+     *
+     *   String body = "{\"tool\":\"mark_pending\",\"message_id\":%d}".formatted(messageId);
+     *   POST to mcpUrl with brainKey header
+     *   return resp.statusCode() == 200;
+     *
+     * Callers check the return value:
+     *   true  → message is pending again; will be retried on the next poll
+     *   false → reset unavailable; caller falls through to the dead-letter path
+     *
+     * Feature request filed: OpenBrain thought #mark-pending-feature-request
+     * See ARCHITECTURE.md §4.3 for the failure contract this enables.
+     *
+     * @return false always (not implemented)
      */
-    public void resetMessage(int thoughtId) {
-        try {
-            String body = """
-                {"tool":"update_thought","id":%d,"status":"active"}
-                """.formatted(thoughtId);
-
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(mcpUrl))
-                .timeout(TIMEOUT)
-                .header("Content-Type", "application/json")
-                .header("x-brain-key", brainKey)
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
-
-            client.send(request, HttpResponse.BodyHandlers.discarding());
-            log.info("Reset thought " + thoughtId + " to active for retry");
-        } catch (Exception e) {
-            log.warning("Failed to reset thought " + thoughtId + " to active: " + e.getMessage());
-        }
+    public boolean resetDelivered(int messageId) {
+        // TODO: implement when macmini adds mark_pending to the messages API
+        log.warning("resetDelivered() not implemented — message_id=" + messageId
+            + " remains 'delivered'; falling through to dead-letter path");
+        return false;
     }
 
     /**
-     * Mark a thought as archived — signals "this message has been processed".
+     * Archive a message — signals "processing complete, do not re-deliver".
      * Called after the agent successfully handles a pending message.
+     * Accepts any message status (pending, delivered, or already archived).
      */
-    public void markArchived(int thoughtId) {
+    public void markArchived(int messageId) {
         try {
             String body = """
-                {"tool":"update_thought","id":%d,"status":"archived"}
-                """.formatted(thoughtId);
+                {"tool":"mark_archived","message_id":%d}
+                """.formatted(messageId);
 
             HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(mcpUrl))
@@ -227,42 +241,64 @@ public class OpenBrainStore {
                 .build();
 
             client.send(request, HttpResponse.BodyHandlers.discarding());
-            log.fine("Marked thought " + thoughtId + " as archived");
+            log.fine("Marked message " + messageId + " as archived");
         } catch (Exception e) {
-            log.warning("Failed to archive thought " + thoughtId + ": " + e.getMessage());
+            log.warning("Failed to archive message " + messageId + ": " + e.getMessage());
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Session context (thoughts table — unchanged)
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Parse a JSON array of thought objects from an OpenBrain response.
-     * Extracts id, content, and the "from:"/"to:" tag values.
+     * Store a dead-letter record in OpenBrain when message processing fails.
+     *
+     * The message has already been archived (cleared from "delivered" limbo)
+     * before this is called. This thought provides an auditable record so
+     * the failure can be investigated or replayed manually.
+     *
+     * Uses the thoughts table (not messages) — no status transitions, never
+     * re-delivered. Tagged for easy lookup: dead-letter + thread:<id>.
      */
-    private java.util.List<PendingMessage> parseMessages(String json) {
-        java.util.List<PendingMessage> messages = new java.util.ArrayList<>();
-        Json thoughts = Json.parse(json);
-        if (!thoughts.isArray()) return messages;
+    public void storeDeadLetter(PendingMessage msg, String errorReason) {
+        try {
+            String content = Json.escape(
+                "Dead-letter: processing failed for message_id=" + msg.messageId()
+                + " thread_id=" + msg.threadId()
+                + " from=" + msg.fromNode()
+                + " to=" + msg.toNode()
+                + " error=" + (errorReason != null ? errorReason : "unknown")
+                + " content_preview=" + msg.content().substring(0, Math.min(200, msg.content().length())));
 
-        for (Json thought : thoughts.asList()) {
-            int id = thought.getInt("id", -1);
-            if (id < 0) continue;
+            String body = """
+                {
+                  "tool": "capture_thought",
+                  "content": "%s",
+                  "category": "dead-letter",
+                  "project": "messenger",
+                  "status": "active",
+                  "tags": ["dead-letter", "thread:%d", "from:%s"],
+                  "source": "messenger-poller"
+                }
+                """.formatted(content, msg.threadId(), Json.escape(msg.fromNode()));
 
-            String content  = thought.getString("content", "");
-            String fromNode = "unknown";
-            String toNode   = "all";
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
 
-            for (Json tag : thought.get("tags").asList()) {
-                String t = tag.asString();
-                if (t.startsWith("from:")) fromNode = t.substring(5);
-                else if (t.startsWith("to:")) toNode = t.substring(3);
-            }
-
-            long threadId = thought.has("thread_id")
-                ? thought.getLong("thread_id") : (long) id;
-
-            messages.add(new PendingMessage(id, threadId, fromNode, toNode, content));
+            client.send(request, HttpResponse.BodyHandlers.discarding());
+            log.warning("Dead-letter stored in OpenBrain for message_id=" + msg.messageId()
+                + " thread_id=" + msg.threadId());
+        } catch (Exception e) {
+            // Best-effort — if OpenBrain is also down, log locally and move on.
+            log.warning("Failed to store dead-letter for message_id=" + msg.messageId()
+                + ": " + e.getMessage());
         }
-
-        return messages;
     }
 
     /**
@@ -336,13 +372,74 @@ public class OpenBrainStore {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * A pending message retrieved from OpenBrain.
+     * Parse messages from a get_inbox response.
      *
-     * thoughtId — the OpenBrain thought/message id (used for markArchived)
-     * threadId  — conversation thread this message belongs to (used for per-thread
-     *             serialization in MessagePoller). Once migrated to the messages
-     *             table this will be the true thread_id; until then it equals thoughtId.
+     * Handles two possible response shapes from OpenBrain:
+     *   1. Flat array:  [{id, thread_id, from_node, to_node, content}, ...]
+     *   2. Structured:  {direct: [...], broadcasts: [...]}
+     *
+     * If the server adds new shapes in future, this method will return an
+     * empty list rather than throw, so the poller degrades gracefully.
      */
-    public record PendingMessage(int thoughtId, long threadId, String fromNode, String toNode, String content) {}
+    private java.util.List<PendingMessage> parseInboxMessages(String json) {
+        java.util.List<PendingMessage> messages = new java.util.ArrayList<>();
+        Json root = Json.parse(json);
+
+        if (root.isArray()) {
+            for (Json msg : root.asList()) {
+                PendingMessage pm = parseOneMessage(msg);
+                if (pm != null) messages.add(pm);
+            }
+        } else if (root.isObject()) {
+            // {direct: [...], broadcasts: [...]}
+            for (Json msg : root.get("direct").asList()) {
+                PendingMessage pm = parseOneMessage(msg);
+                if (pm != null) messages.add(pm);
+            }
+            for (Json msg : root.get("broadcasts").asList()) {
+                PendingMessage pm = parseOneMessage(msg);
+                if (pm != null) messages.add(pm);
+            }
+        }
+
+        return messages;
+    }
+
+    private PendingMessage parseOneMessage(Json msg) {
+        int  id       = msg.getInt("id", -1);
+        long threadId = msg.getLong("thread_id", -1L);
+        if (id < 0) return null;
+        // If thread_id is absent (e.g. broadcast with no thread), fall back to message id
+        if (threadId < 0) threadId = id;
+
+        String fromNode = msg.getString("from_node", "unknown");
+        String toNode   = msg.getString("to_node",   "all");
+        String content  = msg.getString("content",   "");
+        return new PendingMessage(id, threadId, fromNode, toNode, content);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Value types
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Result of storeMessage(): the message row id and its conversation thread id.
+     *
+     * messageId — used for markDelivered() / markArchived()
+     * threadId  — used for wake-up ping content and per-thread serialization
+     */
+    public record StoreResult(int messageId, long threadId) {}
+
+    /**
+     * A pending message retrieved from the inbox.
+     *
+     * messageId — the messages table row id (used for markDelivered / markArchived)
+     * threadId  — conversation thread (used for per-thread serialization in MessagePoller)
+     */
+    public record PendingMessage(int messageId, long threadId, String fromNode, String toNode, String content) {}
 }

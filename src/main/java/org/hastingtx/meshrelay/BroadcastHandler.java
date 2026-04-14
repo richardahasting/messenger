@@ -63,19 +63,19 @@ public class BroadcastHandler implements HttpHandler {
 
         // Store the broadcast in OpenBrain once, tagged to:all
         // This is the only hard failure point — same as RelayHandler.
-        int threadId;
         if (content == null || content.isBlank()) {
             sendError(exchange, 400, "Missing required field: 'content'");
             return;
         }
+        OpenBrainStore.StoreResult stored;
         try {
-            threadId = brain.storeMessage(fromNode, "all", content);
+            stored = brain.storeMessage(fromNode, "all", content);
         } catch (Exception e) {
             log.severe("Failed to store broadcast in OpenBrain: " + e.getMessage());
             sendError(exchange, 503, "message_store_unavailable");
             return;
         }
-        final int finalThreadId = threadId;
+        final long finalThreadId = stored.threadId();
         final String finalFrom  = fromNode;
 
         // Fan out wake-up pings to all peers concurrently using virtual threads
