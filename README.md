@@ -128,6 +128,48 @@ cp com.hastingtx.messenger.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.hastingtx.messenger.plist
 ```
 
+### MCP Server (Claude Code integration)
+
+The messenger includes an MCP server so Claude Code can send messages, broadcast, and check health directly via tool calls.
+
+#### Install
+
+```bash
+cd ~/projects/messenger
+python3 -m venv .mcp-venv
+.mcp-venv/bin/pip install mcp httpx
+```
+
+#### Register with Claude Code
+
+Add to `~/.claude/mcp.json`:
+```json
+{
+  "messenger": {
+    "command": "/path/to/projects/messenger/.mcp-venv/bin/python",
+    "args": ["/path/to/projects/messenger/mcp_server.py"]
+  }
+}
+```
+
+Or via CLI:
+```bash
+claude mcp add messenger /path/to/projects/messenger/.mcp-venv/bin/python -- /path/to/projects/messenger/mcp_server.py
+```
+
+#### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `msg_relay` | Send a message to a specific node (stores in OpenBrain, wakes target) |
+| `msg_broadcast` | Broadcast to all nodes |
+| `msg_wake` | Send wake-up ping to trigger immediate inbox poll |
+| `msg_health` | Node status: uptime, peers, last poll, messages processed |
+| `msg_ping` | Quick liveness check |
+| `msg_ask_user` | Ask Richard a question via Telegram, wait for reply (up to 15 min) |
+
+The MCP server talks to the local messenger daemon on port 13007. The daemon must be running.
+
 ### Multi-instance (same machine)
 
 Use separate config files. Lock files are derived from config filename:
