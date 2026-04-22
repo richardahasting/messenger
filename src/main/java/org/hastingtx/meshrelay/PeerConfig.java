@@ -163,9 +163,9 @@ public class PeerConfig {
      * Parse a config JSON string (the content field from an OpenBrain thought,
      * or the bootstrap file). Expects: listen_port and peers array.
      */
-    private static PeerConfig parseConfig(String json, String nodeName,
-                                           String obUrl, String obKey,
-                                           String source) {
+    static PeerConfig parseConfig(String json, String nodeName,
+                                   String obUrl, String obKey,
+                                   String source) {
         Json cfg = Json.parse(json);
         int listenPort = cfg.getInt("listen_port", 13007);
 

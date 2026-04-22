@@ -128,7 +128,7 @@ public class MessagePoller implements Runnable {
      *   poll will run one more time after it finishes. Does NOT start a
      *   second concurrent poll.
      */
-    private void triggerPoll() {
+    void triggerPoll() {
         if (!pollInFlight.compareAndSet(false, true)) {
             // A poll is already running — request a follow-up run
             pollPending.set(true);
@@ -171,6 +171,17 @@ public class MessagePoller implements Runnable {
         log.info("Poll found " + pending.size() + " pending message(s)");
 
         for (OpenBrainStore.PendingMessage msg : pending) {
+            if (isSelfBroadcast(msg, config.nodeName)) {
+                // Broadcast originated from this node — we already wrote the
+                // content; don't re-process our own output as inbound work.
+                // The broadcast row is shared across all peers, so DO NOT
+                // archive it (that would hide it from other peers). Just
+                // advance our watermark so get_inbox stops returning it.
+                log.info("Skipping self-broadcast: message_id=" + msg.messageId()
+                    + " thread_id=" + msg.threadId());
+                brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                continue;
+            }
             if (isRateLimited(msg.fromNode())) {
                 log.warning("Rate limited sender=" + msg.fromNode()
                     + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
@@ -180,6 +191,14 @@ public class MessagePoller implements Runnable {
             }
             processWithThreadLock(msg);
         }
+    }
+
+    /**
+     * True when a broadcast (to_node="all") originated from this node.
+     * Package-private for testing.
+     */
+    static boolean isSelfBroadcast(OpenBrainStore.PendingMessage msg, String nodeName) {
+        return "all".equals(msg.toNode()) && nodeName.equals(msg.fromNode());
     }
 
     /**
