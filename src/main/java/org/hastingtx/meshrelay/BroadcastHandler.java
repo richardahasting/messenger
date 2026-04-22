@@ -59,7 +59,9 @@ public class BroadcastHandler implements HttpHandler {
         Json json       = Json.parse(body);
         String fromNode = json.getString("from");
         String content  = json.getString("content");
+        String version  = json.getString("version");
         if (fromNode == null) fromNode = config.nodeName;
+        if (version == null || version.isBlank()) version = Version.VERSION;
 
         // Store the broadcast in OpenBrain once, tagged to:all
         // This is the only hard failure point — same as RelayHandler.
@@ -67,6 +69,7 @@ public class BroadcastHandler implements HttpHandler {
             sendError(exchange, 400, "Missing required field: 'content'");
             return;
         }
+        content = RelayHandler.stampVersionHeader(content, fromNode, version);
         OpenBrainStore.StoreResult stored;
         try {
             stored = brain.storeMessage(fromNode, "all", content);

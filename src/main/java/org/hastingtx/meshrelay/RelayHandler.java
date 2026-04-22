@@ -76,11 +76,12 @@ public class RelayHandler implements HttpHandler {
             return;
         }
 
-        Json json       = Json.parse(body);
-        String toNode   = json.getString("to");
-        String fromNode = json.getString("from");
-        String content  = json.getString("content");
-        long   threadId = json.getLong("thread_id", -1L);
+        Json json        = Json.parse(body);
+        String toNode    = json.getString("to");
+        String fromNode  = json.getString("from");
+        String content   = json.getString("content");
+        String version   = json.getString("version");
+        long   threadId  = json.getLong("thread_id", -1L);
 
         if (toNode == null || toNode.isBlank()) {
             sendError(exchange, 400, "Missing required field: 'to'");
@@ -93,6 +94,10 @@ public class RelayHandler implements HttpHandler {
         if (fromNode == null || fromNode.isBlank()) {
             fromNode = config.nodeName; // default to self
         }
+        if (version == null || version.isBlank()) {
+            version = Version.VERSION; // daemon stamps its own version when caller omits it
+        }
+        content = stampVersionHeader(content, fromNode, version);
 
         String targetUrl = config.urlFor(toNode);
         if (targetUrl == null) {
@@ -127,6 +132,28 @@ public class RelayHandler implements HttpHandler {
         exchange.sendResponseHeaders(200, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
+    }
+
+    /**
+     * Prepend a machine-parseable version header to outgoing message content.
+     * Format: [messenger v&lt;ver&gt; from &lt;node&gt;]\n\n&lt;body&gt;
+     *
+     * This makes the sending daemon's version visible in every stored row — useful
+     * for spotting back-level peers during incident response. Receivers can grep
+     * or regex-extract: ^\[messenger v(\S+) from (\S+)\]
+     *
+     * Defensive against null/blank inputs: missing version falls back to the local
+     * daemon's Version.VERSION, missing node to "unknown", missing content to "".
+     * This keeps the stored row well-formed even if an upstream caller skips the
+     * validation path (e.g. a future code path or a broken MCP caller).
+     *
+     * Package-private for testing.
+     */
+    static String stampVersionHeader(String content, String fromNode, String version) {
+        if (version == null || version.isBlank())  version  = Version.VERSION;
+        if (fromNode == null || fromNode.isBlank()) fromNode = "unknown";
+        if (content == null) content = "";
+        return "[messenger v" + version + " from " + fromNode + "]\n\n" + content;
     }
 
     /**

@@ -40,6 +40,7 @@ public class HealthHandler implements HttpHandler {
         String body = """
             {
               "node": "%s",
+              "version": "%s",
               "status": "ok",
               "uptime_seconds": %d,
               "peers": %s,
@@ -50,6 +51,7 @@ public class HealthHandler implements HttpHandler {
             }
             """.formatted(
                 config.nodeName,
+                Version.VERSION,
                 uptimeSeconds,
                 peerList(),
                 ManagementFactory.getThreadMXBean().getThreadCount(),
