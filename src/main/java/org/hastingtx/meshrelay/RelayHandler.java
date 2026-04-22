@@ -81,6 +81,7 @@ public class RelayHandler implements HttpHandler {
         String fromNode  = json.getString("from");
         String content   = json.getString("content");
         String version   = json.getString("version");
+        String kind      = json.getString("kind");
         long   threadId  = json.getLong("thread_id", -1L);
 
         if (toNode == null || toNode.isBlank()) {
@@ -97,7 +98,7 @@ public class RelayHandler implements HttpHandler {
         if (version == null || version.isBlank()) {
             version = Version.VERSION; // daemon stamps its own version when caller omits it
         }
-        content = stampVersionHeader(content, fromNode, version);
+        content = stampVersionHeader(content, fromNode, version, kind);
 
         String targetUrl = config.urlFor(toNode);
         if (targetUrl == null) {
@@ -136,24 +137,45 @@ public class RelayHandler implements HttpHandler {
 
     /**
      * Prepend a machine-parseable version header to outgoing message content.
-     * Format: [messenger v&lt;ver&gt; from &lt;node&gt;]\n\n&lt;body&gt;
+     * Format: [messenger v&lt;ver&gt; from &lt;node&gt;(  kind=&lt;kind&gt;)?]\n\n&lt;body&gt;
      *
-     * This makes the sending daemon's version visible in every stored row — useful
-     * for spotting back-level peers during incident response. Receivers can grep
-     * or regex-extract: ^\[messenger v(\S+) from (\S+)\]
+     * Kind values recognized by the receiving poller:
+     *   action (default, omitted from header) — triggers processor (Claude CLI)
+     *   ack    — archived without processor invocation
+     *   info   — archived without processor invocation
      *
-     * Defensive against null/blank inputs: missing version falls back to the local
-     * daemon's Version.VERSION, missing node to "unknown", missing content to "".
-     * This keeps the stored row well-formed even if an upstream caller skips the
-     * validation path (e.g. a future code path or a broken MCP caller).
-     *
-     * Package-private for testing.
+     * Receivers can regex-extract: ^\[messenger v(\S+) from (\S+?)(?:\s+kind=(\S+))?\]
      */
     static String stampVersionHeader(String content, String fromNode, String version) {
+        return stampVersionHeader(content, fromNode, version, null);
+    }
+
+    static String stampVersionHeader(String content, String fromNode, String version, String kind) {
         if (version == null || version.isBlank())  version  = Version.VERSION;
         if (fromNode == null || fromNode.isBlank()) fromNode = "unknown";
         if (content == null) content = "";
-        return "[messenger v" + version + " from " + fromNode + "]\n\n" + content;
+        String kindSuffix = (kind != null && !kind.isBlank() && !"action".equals(kind))
+            ? " kind=" + kind : "";
+        return "[messenger v" + version + " from " + fromNode + kindSuffix + "]\n\n" + content;
+    }
+
+    // Matches the version header so poller + other readers can extract kind.
+    // Intentionally lenient: kind is optional, absence ⇒ "action".
+    static final java.util.regex.Pattern HEADER_PATTERN = java.util.regex.Pattern.compile(
+        "^\\[messenger v(\\S+) from (\\S+?)(?:\\s+kind=(\\S+))?\\]"
+    );
+
+    /**
+     * Extract the kind from a stored content header. Returns "action" for messages
+     * without a kind (including messages from old daemons that don't write the
+     * kind suffix). Returns the parsed value otherwise.
+     */
+    public static String extractKind(String content) {
+        if (content == null) return "action";
+        var m = HEADER_PATTERN.matcher(content);
+        if (!m.find()) return "action";
+        String kind = m.group(3);
+        return (kind == null || kind.isBlank()) ? "action" : kind;
     }
 
     /**

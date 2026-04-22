@@ -182,6 +182,23 @@ public class MessagePoller implements Runnable {
                 brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
                 continue;
             }
+            String kind = RelayHandler.extractKind(msg.content());
+            if (!"action".equals(kind)) {
+                // ack / info messages don't need processor invocation — they're
+                // non-actionable signals. Archive immediately so we don't spawn
+                // a Claude CLI session just to "reply" to an acknowledgment.
+                // This is what broke the poller with the 11h zombie: linuxserver
+                // was running claude -p against an ack message whose content
+                // was literally "Roger that. Good rollout."
+                log.info("Skipping non-action message: kind=" + kind
+                    + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId()
+                    + " from=" + msg.fromNode());
+                brain.markArchived(msg.messageId());
+                if ("all".equals(msg.toNode())) {
+                    brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                }
+                continue;
+            }
             if (isRateLimited(msg.fromNode())) {
                 log.warning("Rate limited sender=" + msg.fromNode()
                     + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"

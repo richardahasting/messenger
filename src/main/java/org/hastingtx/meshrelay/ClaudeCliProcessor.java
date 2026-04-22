@@ -142,11 +142,9 @@ public class ClaudeCliProcessor implements MessageProcessor {
             pb.environment().putAll(buildEnv());
             Process proc = pb.start();
 
-            byte[] out = proc.getInputStream().readAllBytes();
-            boolean done = proc.waitFor(3, java.util.concurrent.TimeUnit.MINUTES);
-            if (!done) { proc.destroyForcibly(); return null; }
-
-            String stdout = new String(out, StandardCharsets.UTF_8).trim();
+            String stdout = readWithTimeout(proc, 3);
+            if (stdout == null) return null;
+            stdout = stdout.trim();
             if (stdout.isEmpty()) return null;
 
             try {
@@ -227,17 +225,50 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
         Process proc = pb.start();
 
-        // Read stdout fully — claude -p streams JSON to stdout
-        byte[] stdoutBytes = proc.getInputStream().readAllBytes();
-        String stdout = new String(stdoutBytes, StandardCharsets.UTF_8).trim();
-
-        boolean finished = proc.waitFor(timeoutMinutes, java.util.concurrent.TimeUnit.MINUTES);
-        if (!finished) {
-            proc.destroyForcibly();
+        String stdout = readWithTimeout(proc, timeoutMinutes);
+        if (stdout == null) {
             throw new Exception("claude CLI timed out after " + timeoutMinutes + "m");
         }
+        stdout = stdout.trim();
 
         return parseCliOutput(stdout, threadId);
+    }
+
+    /**
+     * Run a subprocess with a hard timeout that actually fires.
+     *
+     * The obvious pattern — {@code readAllBytes()} followed by
+     * {@code waitFor(timeout)} — is broken because {@code readAllBytes}
+     * blocks until stdout closes. If the subprocess hangs with stdout open
+     * (auth stall, upstream API wedge, tool retry loop), {@code readAllBytes}
+     * never returns and the timeout check is never reached. Observed
+     * in production: a claude subprocess held the poller hostage for
+     * 11.5 hours because this race-free-looking code can't actually race.
+     *
+     * Fix: read stdout on a virtual thread so {@code waitFor(timeout)} runs
+     * on the main path and can hard-kill the subprocess on timeout.
+     *
+     * @return trimmed stdout on clean exit, or null on timeout (subprocess killed).
+     */
+    private String readWithTimeout(Process proc, int minutes) throws Exception {
+        var stdoutBuf = new java.io.ByteArrayOutputStream();
+        Thread reader = Thread.ofVirtual().start(() -> {
+            try { proc.getInputStream().transferTo(stdoutBuf); }
+            catch (java.io.IOException ignored) { /* stream closed on kill */ }
+        });
+
+        boolean finished = proc.waitFor(minutes, java.util.concurrent.TimeUnit.MINUTES);
+        if (!finished) {
+            log.warning("claude CLI exceeded " + minutes + "m — destroying subprocess");
+            proc.destroyForcibly();
+            // Give the reader a brief moment to see EOF after destroyForcibly, then bail
+            reader.join(Duration.ofSeconds(5));
+            return null;
+        }
+
+        // Process exited cleanly; drain the reader
+        reader.join(Duration.ofSeconds(5));
+        return stdoutBuf.toString(StandardCharsets.UTF_8);
     }
 
     private String parseCliOutput(String stdout, long threadId) {

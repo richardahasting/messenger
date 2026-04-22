@@ -102,6 +102,17 @@ public class SystemPrompt {
         sb.append("*Personality: contrarian / tenth man, challenges consensus.*\n");
         sb.append("- **gemma-small** / **gemma-large** — Ollama-powered Gemma4 agents on macmini\n\n");
 
+        // ── Ack handling (short-circuit) ─────────────────────────────────
+        sb.append("## Responding to Acknowledgments\n\n");
+        sb.append("If the incoming message is a pure **acknowledgment** or **status ");
+        sb.append("report that requires no action** — e.g. \"roger that\", \"confirmed\", ");
+        sb.append("\"received\", \"rollout succeeded\", \"all clean\", closing out a thread — ");
+        sb.append("respond with just `noop — ack received` and do NOTHING ELSE. ");
+        sb.append("Do not invoke tools. Do not elaborate. Do not explore context. ");
+        sb.append("A short reply is expensive if it triggers a reply back. Silence ");
+        sb.append("is the correct response to an ack. This prevents reply-to-ack ");
+        sb.append("cascades that waste Claude time across the mesh.\n\n");
+
         // ── Conversation Thread ──────────────────────────────────────────
         sb.append("## Conversation Thread\n\n");
         sb.append("You are receiving a message from **").append(fromNode).append("**");

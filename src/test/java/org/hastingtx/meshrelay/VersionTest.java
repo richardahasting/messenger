@@ -87,6 +87,58 @@ class VersionTest {
     }
 
     @Test
+    void stampVersionHeaderActionKindOmitsSuffix() {
+        // "action" is the default — don't clutter the header with it
+        String out = RelayHandler.stampVersionHeader("body", "linuxserver", "1.1.3", "action");
+        assertEquals("[messenger v1.1.3 from linuxserver]\n\nbody", out);
+    }
+
+    @Test
+    void stampVersionHeaderNullKindOmitsSuffix() {
+        String out = RelayHandler.stampVersionHeader("body", "linuxserver", "1.1.3", null);
+        assertEquals("[messenger v1.1.3 from linuxserver]\n\nbody", out);
+    }
+
+    @Test
+    void stampVersionHeaderAckKindIncludedInHeader() {
+        String out = RelayHandler.stampVersionHeader("body", "linuxserver", "1.1.3", "ack");
+        assertEquals("[messenger v1.1.3 from linuxserver kind=ack]\n\nbody", out);
+    }
+
+    @Test
+    void stampVersionHeaderInfoKindIncludedInHeader() {
+        String out = RelayHandler.stampVersionHeader("body", "macmini", "1.1.3", "info");
+        assertEquals("[messenger v1.1.3 from macmini kind=info]\n\nbody", out);
+    }
+
+    @Test
+    void extractKindFromActionHeader() {
+        // No kind suffix → "action"
+        assertEquals("action", RelayHandler.extractKind(
+            "[messenger v1.1.3 from linuxserver]\n\nbody"));
+    }
+
+    @Test
+    void extractKindFromAckHeader() {
+        assertEquals("ack", RelayHandler.extractKind(
+            "[messenger v1.1.3 from linuxserver kind=ack]\n\nbody"));
+    }
+
+    @Test
+    void extractKindFromInfoHeader() {
+        assertEquals("info", RelayHandler.extractKind(
+            "[messenger v1.1.3 from macmini kind=info]\n\nbody"));
+    }
+
+    @Test
+    void extractKindDefaultsToActionOnMissingHeader() {
+        // Messages from old daemons without any header
+        assertEquals("action", RelayHandler.extractKind("raw body text"));
+        assertEquals("action", RelayHandler.extractKind(""));
+        assertEquals("action", RelayHandler.extractKind(null));
+    }
+
+    @Test
     void stampVersionHeaderDoesNotCollapsePriorHeaders() {
         // If the body already has a header (e.g. a quoted message), we don't
         // try to deduplicate — each hop stamps its own. Last stamper wins visually.

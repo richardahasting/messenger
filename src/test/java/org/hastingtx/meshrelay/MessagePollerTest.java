@@ -208,6 +208,84 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
+    void ackMessageIsArchivedWithoutProcessorCall() {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String ackContent = RelayHandler.stampVersionHeader(
+            "Roger that. Good rollout.", "macmini", "1.1.3", "ack");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            700, 700L, "macmini", "linuxserver", ackContent));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "ack messages must NOT reach the processor (prevents reply-to-ack cascade)");
+        assertEquals(List.of(700), brain.archived,
+            "ack messages must be archived so they don't reappear");
+        assertTrue(brain.delivered.isEmpty(),
+            "no need to mark delivered — we're not processing it");
+    }
+
+    @Test
+    @Timeout(10)
+    void infoMessageAlsoBypassesProcessor() {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String infoContent = RelayHandler.stampVersionHeader(
+            "FYI: macmini disk at 70% — no action needed.",
+            "macmini", "1.1.3", "info");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            701, 701L, "macmini", "linuxserver", infoContent));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get());
+        assertEquals(List.of(701), brain.archived);
+    }
+
+    @Test
+    @Timeout(10)
+    void actionMessageIsProcessedNormally() {
+        // Regression guard: kind=action (the default) must still flow through processor.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String actionContent = RelayHandler.stampVersionHeader(
+            "please restart foo", "macmini", "1.1.3", "action");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            702, 702L, "macmini", "linuxserver", actionContent));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(1, proc.processCount.get(),
+            "action messages must go through the processor");
+    }
+
+    @Test
+    @Timeout(10)
+    void oldMessageWithoutHeaderProcessesAsAction() {
+        // Messages from pre-1.1.0 daemons don't have a version header at all.
+        // Must default to action so we don't silently drop them.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            703, 703L, "macmini", "linuxserver", "plain legacy content"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(1, proc.processCount.get(),
+            "headerless messages default to action — processor must still run");
+    }
+
+    @Test
+    @Timeout(10)
     void mixedInboxProcessesPeerMessagesAndSkipsSelfBroadcast() {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);

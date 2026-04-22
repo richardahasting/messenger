@@ -60,6 +60,7 @@ public class BroadcastHandler implements HttpHandler {
         String fromNode = json.getString("from");
         String content  = json.getString("content");
         String version  = json.getString("version");
+        String kind     = json.getString("kind");
         if (fromNode == null) fromNode = config.nodeName;
         if (version == null || version.isBlank()) version = Version.VERSION;
 
@@ -69,7 +70,7 @@ public class BroadcastHandler implements HttpHandler {
             sendError(exchange, 400, "Missing required field: 'content'");
             return;
         }
-        content = RelayHandler.stampVersionHeader(content, fromNode, version);
+        content = RelayHandler.stampVersionHeader(content, fromNode, version, kind);
         OpenBrainStore.StoreResult stored;
         try {
             stored = brain.storeMessage(fromNode, "all", content);
