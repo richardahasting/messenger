@@ -217,14 +217,15 @@ brain                  # interactive mode
 - **Coalescing polls**: N concurrent wake-ups collapse into at most 2 sequential poll runs.
 - **Per-thread serialization**: Messages with the same `thread_id` are processed sequentially. Different threads run concurrently.
 - **Per-sender rate limiting**: 3 messages per 10 minutes per sender. Excess messages are archived without processing.
+- **Self-broadcast filter**: Broadcasts (`to_node: "all"`) from this node are skipped at poll intake — the watermark is advanced but the row is not archived (other peers share it). Prevents echo loops where a node processes its own `to_node: all` replies as inbound work.
 - **Single-instance lock**: OS-level file lock prevents duplicate daemons per config.
 
 ## Tests
 
-159 tests covering:
+165 tests covering:
 - `JsonTest` — Recursive-descent parser, escape/unescape, null safety, error handling
 - `OpenBrainStoreTest` — Messages-table API parsing, store response, inbox formats
-- `MessagePollerTest` — Request parsing, missing fields, special characters
+- `MessagePollerTest` — Request parsing, self-broadcast filter (predicate + integration), missing fields, special characters
 - `BroadcastHandlerTest` — Content validation, response format
 - `PeerConfigTest` — Config parsing, defaults, overrides
 - `SessionManagementTest` — Session entry lifecycle, summary formats, context loading
