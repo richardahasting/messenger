@@ -14,14 +14,17 @@ import java.time.Instant;
  */
 public class HealthHandler implements HttpHandler {
 
-    private final Instant        startTime;
-    private final PeerConfig    config;
-    private final MessagePoller poller;
+    private final Instant          startTime;
+    private final PeerConfig       config;
+    private final MessagePoller    poller;
+    private final MessageProcessor processor;
 
-    public HealthHandler(PeerConfig config, MessagePoller poller, Instant startTime) {
+    public HealthHandler(PeerConfig config, MessagePoller poller, Instant startTime,
+                         MessageProcessor processor) {
         this.config    = config;
         this.poller    = poller;
         this.startTime = startTime;
+        this.processor = processor;
     }
 
     @Override
@@ -41,6 +44,7 @@ public class HealthHandler implements HttpHandler {
             {
               "node": "%s",
               "version": "%s",
+              "processor": "%s",
               "status": "ok",
               "uptime_seconds": %d,
               "peers": %s,
@@ -52,6 +56,7 @@ public class HealthHandler implements HttpHandler {
             """.formatted(
                 config.nodeName,
                 Version.VERSION,
+                processor.name(),
                 uptimeSeconds,
                 peerList(),
                 ManagementFactory.getThreadMXBean().getThreadCount(),

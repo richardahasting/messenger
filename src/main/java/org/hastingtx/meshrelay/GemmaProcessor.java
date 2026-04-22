@@ -28,6 +28,9 @@ public class GemmaProcessor implements MessageProcessor {
 
     private static final Logger log = Logger.getLogger(GemmaProcessor.class.getName());
 
+    @Override
+    public String name() { return "gemma"; }
+
     private static final String DEFAULT_OLLAMA_URL   = "http://192.168.0.226:11434";
     private static final String DEFAULT_OLLAMA_MODEL = "gemma4:e4b";
     private static final Duration INFERENCE_TIMEOUT  = Duration.ofMinutes(10);

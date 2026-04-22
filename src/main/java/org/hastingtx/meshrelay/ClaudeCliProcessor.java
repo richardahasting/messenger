@@ -45,6 +45,9 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
     private static final Logger log = Logger.getLogger(ClaudeCliProcessor.class.getName());
 
+    @Override
+    public String name() { return "claude-cli"; }
+
     private final String model;
     private final int    timeoutMinutes;
     private final int    sessionTtlMinutes;

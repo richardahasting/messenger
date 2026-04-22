@@ -114,8 +114,21 @@ public class MeshRelay {
             //   3. logging()          — safe no-op fallback
             processor = ClaudeCliProcessor.create(client, config, brain);
             if (processor == null) processor = GemmaProcessor.create(client, config);
-            if (processor == null) processor = MessageProcessor.logging();
+            if (processor == null) {
+                processor = MessageProcessor.logging();
+                // Loud warning — a node in logging-noop mode will poll messages,
+                // call the no-op, mark them archived, and report
+                // messages_processed=0. Looks healthy from outside but does nothing.
+                // macbook-air hit exactly this for 8 days; the banner is meant to
+                // surface it immediately at startup.
+                log.severe("⚠ NO PROCESSOR AVAILABLE — falling back to logging() no-op."
+                    + " Claude CLI not found AND Gemma/Ollama unreachable."
+                    + " This node will appear healthy but will not actually process messages."
+                    + " Fix: ensure 'claude' is on PATH, or set processor=gemma in config"
+                    + " and ensure OLLAMA_URL is reachable.");
+            }
         }
+        log.info("Active processor: " + processor.name());
 
         MessagePoller poller = new MessagePoller(config, brain, processor);
         poller.startInBackground();
@@ -132,7 +145,7 @@ public class MeshRelay {
         server.createContext("/relay",     new RelayHandler(client, config, brain));
         server.createContext("/broadcast", new BroadcastHandler(client, config, brain));
         server.createContext("/wake",      new WakeHandler(config, poller));
-        server.createContext("/health",    new HealthHandler(config, poller, java.time.Instant.now()));
+        server.createContext("/health",    new HealthHandler(config, poller, java.time.Instant.now(), processor));
         server.createContext("/ping", exchange -> {
             byte[] pong = "pong".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, pong.length);
