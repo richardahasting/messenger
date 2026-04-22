@@ -43,6 +43,13 @@ public class MeshRelay {
     private static final Logger log = Logger.getLogger(MeshRelay.class.getName());
 
     public static void main(String[] args) throws Exception {
+        // ── Version banner ────────────────────────────────────────────────────
+        // First line in the log so `tail -1` of an old log reveals the running
+        // version without needing to hit /health. Also makes mixed-version
+        // rollouts obvious when grepping journal/launchd output across nodes.
+        log.info("messenger v" + Version.VERSION + " starting (java "
+            + System.getProperty("java.version") + ")");
+
         // ── Single-instance lock ──────────────────────────────────────────────
         // Must be first — before config load, before anything else.
         // Keep the FileChannel open for the entire process lifetime; closing it
@@ -143,7 +150,8 @@ public class MeshRelay {
 
         server.start();
         log.info("messenger started — node='" + config.nodeName
-            + "' port=" + config.listenPort
+            + "' version=" + Version.VERSION
+            + " port=" + config.listenPort
             + " openBrain=" + config.openBrainUrl
             + " config_source=" + config.source);
     }
