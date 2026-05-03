@@ -54,6 +54,7 @@ public class MessagePoller implements Runnable {
     private final PeerConfig       config;
     private final OpenBrainStore   brain;
     private final MessageProcessor processor;
+    private final RelaySender      relaySender;
 
     private volatile boolean running  = true;
     private Instant lastPollTime      = Instant.EPOCH;
@@ -92,9 +93,15 @@ public class MessagePoller implements Runnable {
     private final ConcurrentHashMap<String, Deque<Instant>> senderTimestamps = new ConcurrentHashMap<>();
 
     public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor) {
-        this.config    = config;
-        this.brain     = brain;
-        this.processor = processor;
+        this(config, brain, processor, RelaySender.NOOP);
+    }
+
+    public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor,
+                         RelaySender relaySender) {
+        this.config      = config;
+        this.brain       = brain;
+        this.processor   = processor;
+        this.relaySender = relaySender != null ? relaySender : RelaySender.NOOP;
     }
 
     /** Start the polling loop on a virtual thread. Returns immediately. */
@@ -217,10 +224,12 @@ public class MessagePoller implements Runnable {
                 // was running claude -p against an ack message whose content
                 // was literally "Roger that. Good rollout."
                 //
-                // ping is a stub at this stage — full daemon-handled pong reply
-                // is implemented in issue #15. reply→waiter delivery (dedup
-                // cache notification) lands in issue #17.
-                if (isKnownNonActionKind(kind)) {
+                // ping (issue #14): daemon auto-responds with kind=reply
+                // payload="pong" before archiving. reply→waiter delivery
+                // (dedup cache notification) lands in issue #17.
+                if ("ping".equals(kind)) {
+                    handlePing(msg);
+                } else if (isKnownNonActionKind(kind)) {
                     log.info("Skipping non-action message: kind=" + kind
                         + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId()
                         + " from=" + msg.fromNode());
@@ -266,6 +275,55 @@ public class MessagePoller implements Runnable {
             case "reply", "ack", "info", "progress", "ping" -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Daemon-handled response to {@code kind=ping} — emit
+     * {@code kind=reply payload="pong" reply_policy=NO_REPLY} via the same
+     * /relay channel all other outbound traffic uses, then let the caller
+     * archive the inbound ping.
+     *
+     * <p>Honours the spec's "with {@code ack_policy=REQ_ACK}" guard
+     * (docs/protocol-v1.2.md § "Receiver behavior" step 3): if the sender
+     * explicitly set {@code ack=NO_ACK}, no pong is emitted. Default is
+     * REQ_ACK, so the typical inbound ping gets a pong back.
+     *
+     * <p>The reply carries {@code in_reply_to=<inbound seq_id>} so the caller
+     * can correlate the pong to its outbound ping. If the inbound header has
+     * no {@code seq=} (pre-v1.2 sender, or malformed), a synthetic
+     * {@code <peer>:<thread>:0} is used so the {@code /relay} 400-on-missing
+     * guard does not fire.
+     */
+    private void handlePing(OpenBrainStore.PendingMessage msg) {
+        String content    = msg.content();
+        String ackPolicy  = RelayHandler.extractHeaderField(content, "ack", "REQ_ACK");
+        if (!"REQ_ACK".equals(ackPolicy)) {
+            log.info("Skipping pong for ping with ack=" + ackPolicy
+                + " from=" + msg.fromNode() + " thread_id=" + msg.threadId());
+            return;
+        }
+        String seq = RelayHandler.extractHeaderField(content, "seq", null);
+        if (seq == null || seq.isBlank()) {
+            // Pre-v1.2 sender, or stripped header — synthesise so the reply's
+            // mandatory in_reply_to is non-empty.
+            seq = msg.fromNode() + ":" + msg.threadId() + ":0";
+        }
+
+        boolean sent = relaySender.send(
+            /*to=*/         msg.fromNode(),
+            /*from=*/       config.nodeName,
+            /*content=*/    "pong",
+            /*kind=*/       "reply",
+            /*inReplyTo=*/  seq,
+            /*replyPolicy=*/"NO_REPLY",
+            /*threadId=*/   msg.threadId());
+
+        if (sent) {
+            log.info("Auto-replied to ping from=" + msg.fromNode() + " seq=" + seq);
+        } else {
+            log.warning("Auto-pong send failed — peer will see no reply: from="
+                + msg.fromNode() + " seq=" + seq);
+        }
     }
 
     /**

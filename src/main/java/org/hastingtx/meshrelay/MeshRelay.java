@@ -130,7 +130,11 @@ public class MeshRelay {
         }
         log.info("Active processor: " + processor.name());
 
-        MessagePoller poller = new MessagePoller(config, brain, processor);
+        // Self-relay sender: the v1.2 ping handler (issue #14) emits its
+        // auto-pong by POSTing to localhost:<listenPort>/relay so the outbound
+        // path is identical to every other relay caller.
+        RelaySender relaySender = new HttpRelaySender(client, config.listenPort);
+        MessagePoller poller = new MessagePoller(config, brain, processor, relaySender);
         poller.startInBackground();
 
         // ── HTTP server ───────────────────────────────────────────────────────

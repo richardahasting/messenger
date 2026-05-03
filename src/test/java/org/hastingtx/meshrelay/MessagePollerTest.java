@@ -373,8 +373,11 @@ class MessagePollerTest {
     @Test
     @Timeout(10)
     void pingMessageBypassesProcessor() {
-        // ping is daemon-handled — the auto-pong response arrives in issue #15.
-        // For now (issue #13) the poller archives without invoking Claude.
+        // ping is daemon-handled (issue #14) — auto-pong emission is exercised
+        // in PingHandlerTest. Here we just guard the two invariants the rest
+        // of the dispatch table relies on: processor untouched, ping archived.
+        // Default 3-arg constructor uses RelaySender.NOOP so no pong attempt
+        // contaminates this assertion.
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         String pingContent = RelayHandler.stampVersionHeader(
@@ -387,7 +390,7 @@ class MessagePollerTest {
         poller.triggerPoll();
 
         assertEquals(0, proc.processCount.get(),
-            "ping must not run Claude — daemon handles it directly (issue #15)");
+            "ping must not run Claude — daemon handles it directly");
         assertEquals(List.of(902), brain.archived);
     }
 
