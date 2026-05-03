@@ -113,6 +113,26 @@ public class SystemPrompt {
         sb.append("is the correct response to an ack. This prevents reply-to-ack ");
         sb.append("cascades that waste Claude time across the mesh.\n\n");
 
+        // ── Progress logging for long tasks ──────────────────────────────
+        // DRAFT — refine wording during integration testing once we observe how
+        // Claude actually follows these instructions under load. See spec
+        // protocol-v1.2.md § Open Questions #1.
+        sb.append("## Reporting progress on long tasks\n\n");
+        sb.append("For any task that may take more than ~30 seconds — file searches, ");
+        sb.append("multi-step builds, server reconfigs, anything involving several tool ");
+        sb.append("calls — pipe every Bash invocation through `tee -a $MESSENGER_PROGRESS_LOG`. ");
+        sb.append("The requester reads the tail of that file to see that you are still ");
+        sb.append("working and what stage you're on.\n\n");
+        sb.append("  ls -la /etc 2>&1 | tee -a $MESSENGER_PROGRESS_LOG\n");
+        sb.append("  mvn test 2>&1   | tee -a $MESSENGER_PROGRESS_LOG\n\n");
+        sb.append("When the task completes — whether it succeeds, fails, or you abandon it — ");
+        sb.append("remove the log file:\n\n");
+        sb.append("  rm -f $MESSENGER_PROGRESS_LOG\n\n");
+        sb.append("Do not log secrets, tokens, or credentials. Do not write progress ");
+        sb.append("narration by hand; let `tee` capture real output. Non-Bash tool calls ");
+        sb.append("(Read, Grep, Edit, etc.) are logged automatically by the harness — you ");
+        sb.append("don't need to echo them yourself.\n\n");
+
         // ── Conversation Thread ──────────────────────────────────────────
         sb.append("## Conversation Thread\n\n");
         sb.append("You are receiving a message from **").append(fromNode).append("**");

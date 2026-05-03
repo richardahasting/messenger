@@ -267,6 +267,54 @@ class SystemPromptTest {
     }
 
     @Nested
+    class ProgressLogging {
+
+        @Test
+        void promptContainsProgressSectionHeader() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("## Reporting progress on long tasks"),
+                "Prompt should contain the progress-logging section header");
+        }
+
+        @Test
+        void promptMentionsProgressLogEnvVar() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("$MESSENGER_PROGRESS_LOG"),
+                "Prompt should reference the MESSENGER_PROGRESS_LOG env var");
+        }
+
+        @Test
+        void promptMentionsTeeAppend() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("tee -a"),
+                "Prompt should instruct piping through `tee -a` to append");
+        }
+
+        @Test
+        void promptMentionsRmFOnCompletion() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("rm -f"),
+                "Prompt should instruct removing the log file via `rm -f` on completion");
+        }
+
+        @Test
+        void promptWarnsAgainstLoggingSecrets() {
+            String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
+            assertTrue(prompt.contains("Do not log secrets"),
+                "Prompt should warn against logging secrets/tokens/credentials");
+        }
+
+        @Test
+        void textOnlyHasNoProgressSection() {
+            // Constrained Gemma prompt should NOT carry the progress instructions —
+            // text-only models don't run Bash and never see MESSENGER_PROGRESS_LOG.
+            String prompt = buildTestPrompt("macmini", "linuxserver", 500, false);
+            assertFalse(prompt.contains("## Reporting progress on long tasks"));
+            assertFalse(prompt.contains("$MESSENGER_PROGRESS_LOG"));
+        }
+    }
+
+    @Nested
     class SummarizePrompt {
 
         @Test
