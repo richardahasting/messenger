@@ -179,6 +179,22 @@ public class RelayHandler implements HttpHandler {
     }
 
     /**
+     * Strip the version header from stored content, returning just the body.
+     * Returns the input unchanged when no header is present (legacy messages).
+     */
+    public static String extractBody(String content) {
+        if (content == null) return "";
+        var m = HEADER_PATTERN.matcher(content);
+        if (!m.find()) return content;
+        // Skip past the matched header and any immediately-following whitespace/newlines
+        int start = m.end();
+        while (start < content.length() && Character.isWhitespace(content.charAt(start))) {
+            start++;
+        }
+        return content.substring(start);
+    }
+
+    /**
      * Send a wake-up ping to the target peer with retries.
      *
      * The wake-up body is intentionally minimal — just enough for the peer

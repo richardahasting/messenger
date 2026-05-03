@@ -149,4 +149,29 @@ class VersionTest {
         assertTrue(out.contains("[messenger v1.0.0 from macmini]"),
             "Prior header must be preserved inside the body");
     }
+
+    @Test
+    void extractBodyStripsHeader() {
+        assertEquals("noop — ack received", RelayHandler.extractBody(
+            "[messenger v1.1.5 from linuxserver]\n\nnoop — ack received"));
+    }
+
+    @Test
+    void extractBodyStripsHeaderWithKindSuffix() {
+        assertEquals("Roger that", RelayHandler.extractBody(
+            "[messenger v1.1.5 from macmini kind=ack]\n\nRoger that"));
+    }
+
+    @Test
+    void extractBodyReturnsInputWhenNoHeader() {
+        assertEquals("plain content", RelayHandler.extractBody("plain content"));
+        assertEquals("", RelayHandler.extractBody(""));
+        assertEquals("", RelayHandler.extractBody(null));
+    }
+
+    @Test
+    void extractBodyHandlesMultilineBody() {
+        String input = "[messenger v1.1.5 from linuxserver]\n\nline 1\nline 2\nline 3";
+        assertEquals("line 1\nline 2\nline 3", RelayHandler.extractBody(input));
+    }
 }

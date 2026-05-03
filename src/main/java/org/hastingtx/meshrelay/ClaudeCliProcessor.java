@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 
 /**
  * MessageProcessor that delegates to the Claude Code CLI (claude -p).
@@ -179,6 +180,20 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
     @Override
     public void process(OpenBrainStore.PendingMessage msg) throws Exception {
+        // Doom-loop guard: skip Claude invocation on bare acknowledgement payloads.
+        // The system prompt instructs Claude to reply "noop — ack received" for
+        // ack-shaped inbound content, but those replies go out without kind=ack
+        // (sendReply doesn't stamp kind), so the receiving peer treats them as
+        // actions and triggers another Claude run. Detecting acks at the consumer
+        // side breaks the loop regardless of the sender's header hygiene.
+        // See messenger#9.
+        String body = RelayHandler.extractBody(msg.content());
+        if (isAcknowledgement(body)) {
+            log.info("Skipping ack content — thread_id=" + msg.threadId()
+                + " from=" + msg.fromNode() + " (matched ack pattern, no Claude invocation)");
+            return;
+        }
+
         log.info("Processing via claude CLI — thread_id=" + msg.threadId()
             + " from=" + msg.fromNode());
 
@@ -186,6 +201,23 @@ public class ClaudeCliProcessor implements MessageProcessor {
         sendReply(msg.fromNode(), reply, msg.threadId());
 
         log.info("Reply sent — thread_id=" + msg.threadId() + " to=" + msg.fromNode());
+    }
+
+    // Matches bare acknowledgement payloads like "noop", "ack received",
+    // "noop — ack received" (em-dash) or "noop - ack received" (hyphen).
+    // Case-insensitive; leading whitespace is tolerated via the trim() call.
+    static final Pattern ACK_PATTERN = Pattern.compile(
+        "^(noop|ack received|noop\\s*[—-]\\s*ack(\\s+received)?)\\b",
+        Pattern.CASE_INSENSITIVE
+    );
+
+    /**
+     * True when {@code body} is a bare acknowledgement that does not warrant
+     * a Claude response. Package-private for testability.
+     */
+    static boolean isAcknowledgement(String body) {
+        if (body == null) return false;
+        return ACK_PATTERN.matcher(body.trim()).find();
     }
 
     private String runClaude(long threadId, String fromNode, String userContent) throws Exception {

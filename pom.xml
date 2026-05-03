@@ -7,7 +7,7 @@
 
     <groupId>org.hastingtx</groupId>
     <artifactId>messenger</artifactId>
-    <version>1.1.4</version>
+    <version>1.1.5</version>
     <packaging>jar</packaging>
     <description>Reliable agent-to-agent messaging daemon. Stores full messages in OpenBrain, delivers wake-up pings, polls every 10 minutes as catchup. Zero external dependencies.</description>
 
