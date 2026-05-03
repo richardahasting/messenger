@@ -42,22 +42,29 @@ public class GemmaProcessor implements MessageProcessor {
     private final String     model;
     private final String     chatEndpoint;
     private final String     relayUrl;
+    private final DedupCache dedupCache;
 
     private GemmaProcessor(HttpClient http, PeerConfig config,
-                            String ollamaUrl, String model) {
+                            String ollamaUrl, String model, DedupCache dedupCache) {
         this.http         = http;
         this.config       = config;
         this.ollamaUrl    = ollamaUrl;
         this.model        = model;
         this.chatEndpoint = ollamaUrl + "/api/chat";
         this.relayUrl     = "http://localhost:" + config.listenPort + "/relay";
+        this.dedupCache   = dedupCache;
     }
 
     /**
      * Build a GemmaProcessor if Ollama is reachable, otherwise return null.
      * Caller should fall through to the next processor option on null.
+     *
+     * <p>{@code dedupCache} may be null (legacy callers); when non-null the
+     * processor records each outbound reply in the cache so a duplicate
+     * inbound (#16) replays the response without re-running inference.
      */
-    public static MessageProcessor create(HttpClient http, PeerConfig config) {
+    public static MessageProcessor create(HttpClient http, PeerConfig config,
+                                          DedupCache dedupCache) {
         String ollamaUrl = System.getenv("OLLAMA_URL");
         if (ollamaUrl == null || ollamaUrl.isBlank()) ollamaUrl = DEFAULT_OLLAMA_URL;
 
@@ -80,7 +87,12 @@ public class GemmaProcessor implements MessageProcessor {
 
         log.info("GemmaProcessor active — ollama=" + ollamaUrl + " model=" + model
             + " node=" + config.nodeName);
-        return new GemmaProcessor(http, config, ollamaUrl, model);
+        return new GemmaProcessor(http, config, ollamaUrl, model, dedupCache);
+    }
+
+    /** Backwards-compatible factory — no dedup cache wiring (used in tests). */
+    public static MessageProcessor create(HttpClient http, PeerConfig config) {
+        return create(http, config, null);
     }
 
     @Override
@@ -101,6 +113,18 @@ public class GemmaProcessor implements MessageProcessor {
 
         log.info("Reply sent to " + msg.fromNode() + " thread_id=" + msg.threadId()
             + " in_reply_to=" + inReplyTo);
+
+        // v1.2 dedup cache (issue #16). Record the actual outbound reply so a
+        // duplicate inbound replays this response instead of re-running
+        // inference. Mirrors ClaudeCliProcessor.process(). Skip silently when
+        // the inbound had no seq (pre-v1.2 sender) or no cache was wired.
+        String originalSeq = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+        if (dedupCache != null && originalSeq != null && !originalSeq.isBlank()) {
+            dedupCache.put(
+                new DedupCache.DedupKey(msg.fromNode(), msg.threadId(), originalSeq),
+                new DedupCache.CachedResponse("reply", reply, inReplyTo,
+                    java.time.Instant.now()));
+        }
     }
 
     private String callGemma(String fromNode, long threadId, String userContent) throws Exception {

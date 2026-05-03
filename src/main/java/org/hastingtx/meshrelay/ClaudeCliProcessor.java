@@ -65,9 +65,11 @@ public class ClaudeCliProcessor implements MessageProcessor {
     private final OpenBrainStore  brain;
     private final String          claudeBin;
     private final String          relayUrl;
+    private final DedupCache      dedupCache;
 
     private ClaudeCliProcessor(HttpClient http, PeerConfig config,
-                                OpenBrainStore brain, String claudeBin) {
+                                OpenBrainStore brain, String claudeBin,
+                                DedupCache dedupCache) {
         this.http                  = http;
         this.config                = config;
         this.brain                 = brain;
@@ -77,6 +79,7 @@ public class ClaudeCliProcessor implements MessageProcessor {
         this.timeoutMinutes        = config.claudeTimeoutMinutes;
         this.sessionTtlMinutes     = config.sessionTtlMinutes;
         this.reaperIntervalMinutes = config.reaperIntervalMinutes;
+        this.dedupCache            = dedupCache;
         startSessionReaper();
     }
 
@@ -164,8 +167,13 @@ public class ClaudeCliProcessor implements MessageProcessor {
     /**
      * Build a ClaudeCliProcessor if the claude CLI is reachable, else null.
      * Caller falls through to the next processor option on null.
+     *
+     * <p>{@code dedupCache} may be null (legacy callers); when non-null the
+     * processor records each outbound reply in the cache so a duplicate
+     * inbound (#16) replays the response without re-invoking Claude.
      */
-    public static MessageProcessor create(HttpClient http, PeerConfig config, OpenBrainStore brain) {
+    public static MessageProcessor create(HttpClient http, PeerConfig config,
+                                          OpenBrainStore brain, DedupCache dedupCache) {
         String bin = findClaudeBin();
         if (bin == null) {
             log.warning("claude CLI not found — ClaudeCliProcessor unavailable");
@@ -175,7 +183,12 @@ public class ClaudeCliProcessor implements MessageProcessor {
             + " timeout=" + config.claudeTimeoutMinutes + "m"
             + " sessionTTL=" + config.sessionTtlMinutes + "m"
             + " node=" + config.nodeName);
-        return new ClaudeCliProcessor(http, config, brain, bin);
+        return new ClaudeCliProcessor(http, config, brain, bin, dedupCache);
+    }
+
+    /** Backwards-compatible factory — no dedup cache wiring (used in tests). */
+    public static MessageProcessor create(HttpClient http, PeerConfig config, OpenBrainStore brain) {
+        return create(http, config, brain, null);
     }
 
     @Override
@@ -229,6 +242,19 @@ public class ClaudeCliProcessor implements MessageProcessor {
 
         log.info("Reply sent — thread_id=" + msg.threadId() + " to=" + msg.fromNode()
             + " in_reply_to=" + inReplyTo);
+
+        // v1.2 dedup cache (issue #16). Record the actual outbound reply so a
+        // duplicate inbound replays this response instead of re-invoking
+        // Claude. Cache key uses the original inbound seq from the header (not
+        // the synthesised fallback), so the dedup-check on the next inbound
+        // matches by triple. Skip silently if the inbound had no seq (pre-v1.2
+        // sender) or no cache was wired.
+        String originalSeq = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+        if (dedupCache != null && originalSeq != null && !originalSeq.isBlank()) {
+            dedupCache.put(
+                new DedupCache.DedupKey(msg.fromNode(), msg.threadId(), originalSeq),
+                new DedupCache.CachedResponse("reply", reply, inReplyTo, Instant.now()));
+        }
     }
 
     // Matches bare acknowledgement payloads like "noop", "ack received",

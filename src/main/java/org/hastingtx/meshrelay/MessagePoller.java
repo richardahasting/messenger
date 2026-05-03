@@ -62,6 +62,7 @@ public class MessagePoller implements Runnable {
     private final OpenBrainStore   brain;
     private final MessageProcessor processor;
     private final RelaySender      relaySender;
+    private final DedupCache       dedupCache;
 
     private volatile boolean running  = true;
     private Instant lastPollTime      = Instant.EPOCH;
@@ -108,16 +109,30 @@ public class MessagePoller implements Runnable {
     private final ConcurrentHashMap<String, Deque<Instant>> senderTimestamps = new ConcurrentHashMap<>();
 
     public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor) {
-        this(config, brain, processor, RelaySender.NOOP);
+        this(config, brain, processor, RelaySender.NOOP, new DedupCache());
     }
 
     public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor,
                          RelaySender relaySender) {
+        this(config, brain, processor, relaySender, new DedupCache());
+    }
+
+    public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor,
+                         RelaySender relaySender, DedupCache dedupCache) {
         this.config      = config;
         this.brain       = brain;
         this.processor   = processor;
         this.relaySender = relaySender != null ? relaySender : RelaySender.NOOP;
+        this.dedupCache  = dedupCache  != null ? dedupCache  : new DedupCache();
     }
+
+    /**
+     * Accessor for the in-memory dedup cache (issue #16). Exposed so processors
+     * (e.g. {@link ClaudeCliProcessor}, {@link GemmaProcessor}) can populate the
+     * cache with the actual response payload after they call sendReply, and so
+     * tests can seed/inspect it. Daemon-local — lost on restart.
+     */
+    public DedupCache dedupCache() { return dedupCache; }
 
     /** Start the polling loop on a virtual thread. Returns immediately. */
     public Thread startInBackground() {
@@ -229,7 +244,43 @@ public class MessagePoller implements Runnable {
                 brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
                 continue;
             }
-            String kind = RelayHandler.extractKind(msg.content());
+            String kind  = RelayHandler.extractKind(msg.content());
+            String seqId = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+
+            // v1.2 dedup cache (issue #16). Idempotent retransmit: a duplicate
+            // (from_node, thread_id, seq_id) replays the cached response
+            // without re-invoking the processor. Pre-v1.2 senders without a
+            // seq field skip the cache entirely (no key to dedupe on). See
+            // docs/protocol-v1.2.md § "Receiver behavior" step 2.
+            //
+            // Placement: after status/self-broadcast filters (cheap rejects we
+            // never want to cache against) but before the kind dispatch and
+            // the MAX_TURNS counter (which would otherwise double-count a
+            // duplicate against the per-thread cap).
+            if (seqId != null && !seqId.isBlank()) {
+                DedupCache.DedupKey key = new DedupCache.DedupKey(
+                    msg.fromNode(), msg.threadId(), seqId);
+                DedupCache.CachedResponse cached = dedupCache.get(key);
+                if (cached != null) {
+                    if (cached.hasResponse()) {
+                        log.info("Dedup hit — resending cached response: from=" + msg.fromNode()
+                            + " thread_id=" + msg.threadId() + " seq=" + seqId
+                            + " kind=" + cached.kind());
+                        relaySender.send(msg.fromNode(), config.nodeName, cached.payload(),
+                            cached.kind(), cached.inReplyTo(),
+                            "NO_REPLY", msg.threadId());
+                    } else {
+                        log.info("Dedup hit — original was processed-no-response: from="
+                            + msg.fromNode() + " thread_id=" + msg.threadId()
+                            + " seq=" + seqId);
+                    }
+                    brain.markArchived(msg.messageId());
+                    if ("all".equals(msg.toNode())) {
+                        brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                    }
+                    continue;
+                }
+            }
 
             // MAX_TURNS_PER_THREAD backstop (issue #15). Every non-progress
             // inbound increments the per-thread counter; once the count
@@ -411,6 +462,17 @@ public class MessagePoller implements Runnable {
 
         if (sent) {
             log.info("Auto-replied to ping from=" + msg.fromNode() + " seq=" + seq);
+            // v1.2 dedup cache (issue #16): record the pong so a duplicate
+            // ping (same from/thread/seq) replays the same response without
+            // re-emitting from scratch. Inbound seq may have been synthesised
+            // above, but we cache against the original header value so the
+            // dedup-check on the next inbound matches.
+            String originalSeq = RelayHandler.extractHeaderField(content, "seq", null);
+            if (originalSeq != null && !originalSeq.isBlank()) {
+                dedupCache.put(
+                    new DedupCache.DedupKey(msg.fromNode(), msg.threadId(), originalSeq),
+                    new DedupCache.CachedResponse("reply", "pong", seq, Instant.now()));
+            }
         } else {
             log.warning("Auto-pong send failed — peer will see no reply: from="
                 + msg.fromNode() + " seq=" + seq);
@@ -492,6 +554,21 @@ public class MessagePoller implements Runnable {
                 brain.markArchived(msg.messageId());
                 if ("all".equals(msg.toNode())) {
                     brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                }
+                // v1.2 dedup cache (issue #16): record at minimum the
+                // "processed-no-response" sentinel for this key. Processors
+                // that emit an outbound reply (ClaudeCliProcessor,
+                // GemmaProcessor) overwrite the sentinel with the real
+                // response via dedupCache().put(...) once sendReply succeeds —
+                // see those classes. Sentinel placement here covers the
+                // processor-returned-no-output / no-reply paths so a
+                // duplicate is silently swallowed instead of re-running the
+                // processor.
+                String seqId = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+                if (seqId != null && !seqId.isBlank()) {
+                    DedupCache.DedupKey key = new DedupCache.DedupKey(
+                        msg.fromNode(), msg.threadId(), seqId);
+                    if (!dedupCache.contains(key)) dedupCache.putSentinel(key);
                 }
                 recordProcessed(msg.fromNode());
                 totalProcessed++;

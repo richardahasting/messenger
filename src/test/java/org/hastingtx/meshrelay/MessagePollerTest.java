@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.net.http.HttpClient;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -701,6 +702,248 @@ class MessagePollerTest {
             "20 actions must process — progress beats don't count toward the cap");
         assertTrue(brain.delivered.contains(twentiethId),
             "20th non-progress message must have been claimed and processed");
+    }
+
+    // ── v1.2 dedup cache (issue #16) ─────────────────────────────────────
+
+    /**
+     * Processor that records each call and writes a real reply payload into a
+     * shared {@link DedupCache} so duplicate inbound is observably resent
+     * through the relay sender (mirrors what {@link ClaudeCliProcessor} does
+     * in production after sendReply succeeds).
+     */
+    static class CachingTestProcessor implements MessageProcessor {
+        final AtomicInteger processCount = new AtomicInteger(0);
+        final DedupCache    cache;
+
+        CachingTestProcessor(DedupCache cache) { this.cache = cache; }
+
+        @Override
+        public void process(OpenBrainStore.PendingMessage msg) {
+            int n = processCount.incrementAndGet();
+            String seq = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+            if (seq != null && !seq.isBlank()) {
+                cache.put(
+                    new DedupCache.DedupKey(msg.fromNode(), msg.threadId(), seq),
+                    new DedupCache.CachedResponse(
+                        "reply", "response#" + n, seq, Instant.now()));
+            }
+        }
+    }
+
+    /** Captures every {@link RelaySender#send} invocation so dedup-resends are observable. */
+    static class RecordingRelaySender implements RelaySender {
+        record Sent(String to, String from, String content, String kind,
+                    String inReplyTo, String replyPolicy, long threadId) {}
+
+        final List<Sent> sent = new ArrayList<>();
+
+        @Override
+        public boolean send(String toNode, String fromNode, String content,
+                            String kind, String inReplyTo, String replyPolicy, long threadId) {
+            sent.add(new Sent(toNode, fromNode, content, kind, inReplyTo, replyPolicy, threadId));
+            return true;
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void duplicateSeqIdResendsCachedResponseWithoutReprocessing() {
+        // Acceptance from issue #16: "Same (from, thread_id, seq_id) arrives
+        // twice → second triggers cached response, no new processor invocation."
+        // Test from the issue: "Inject same message twice (same seq_id);
+        // assert processor called exactly once, two outbound responses
+        // emitted (the second is the cached resend)."
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        DedupCache cache = new DedupCache();
+        CachingTestProcessor proc = new CachingTestProcessor(cache);
+        RecordingRelaySender relay = new RecordingRelaySender();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc, relay, cache);
+
+        String content = stampAction("what's the lake level?", "macmini", "macmini:42:1");
+
+        // First poll: process the message, cache populated with real response.
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6000, 42L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+        assertEquals(1, proc.processCount.get(),
+            "first inbound must reach the processor");
+
+        // Second poll: same (from, thread, seq) duplicate. Reset RecordingStore
+        // so it serves the duplicate row again, and clear the prior inbox.
+        brain.drained = false;
+        brain.inbox.clear();
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6001, 42L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+
+        // Acceptance: processor called exactly once across both polls.
+        assertEquals(1, proc.processCount.get(),
+            "duplicate seq_id must NOT re-invoke the processor");
+
+        // Acceptance: a single outbound from the cached resend (the first
+        // poll's reply went via the processor's cache.put which doesn't
+        // touch relaySender; the second poll's resend does).
+        assertEquals(1, relay.sent.size(),
+            "duplicate must trigger one cached resend through the relay sender");
+        RecordingRelaySender.Sent resend = relay.sent.get(0);
+        assertEquals("macmini",        resend.to(),          "resend goes back to original sender");
+        assertEquals("linuxserver",    resend.from());
+        assertEquals("response#1",     resend.content(),     "cached payload from first invocation");
+        assertEquals("reply",          resend.kind());
+        assertEquals("NO_REPLY",       resend.replyPolicy(), "all auto-responses carry NO_REPLY");
+        assertEquals("macmini:42:1",   resend.inReplyTo());
+        assertEquals(42L,              resend.threadId());
+
+        // The duplicate inbound is still archived so it doesn't reappear.
+        assertTrue(brain.archived.contains(6001),
+            "duplicate inbound must be archived after the cached resend");
+        assertFalse(brain.delivered.contains(6001),
+            "duplicate must NOT be claimed via markDelivered — never reaches processWithThreadLock");
+    }
+
+    @Test
+    @Timeout(10)
+    void distinctSeqIdsOnSameThreadAreBothProcessed() {
+        // Acceptance from issue #16: "Different seq_id from same sender on
+        // same thread → both processed independently."
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        DedupCache cache = new DedupCache();
+        CachingTestProcessor proc = new CachingTestProcessor(cache);
+        MessagePoller poller = new MessagePoller(cfg, brain, proc, RelaySender.NOOP, cache);
+
+        // Same thread (42), same sender (macmini), different seq_ids
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6100, 42L, "macmini", "linuxserver",
+            stampAction("first turn",  "macmini", "macmini:42:1"), "pending"));
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6101, 42L, "macmini", "linuxserver",
+            stampAction("second turn", "macmini", "macmini:42:2"), "pending"));
+
+        poller.triggerPoll();
+
+        assertEquals(2, proc.processCount.get(),
+            "distinct seq_ids on the same thread must both reach the processor");
+        assertEquals(2, brain.delivered.size(),
+            "both must be claimed (markDelivered) before processing");
+        assertTrue(brain.archived.containsAll(List.of(6100, 6101)));
+    }
+
+    @Test
+    @Timeout(10)
+    void dedupSentinelStopsRepeatRunWithoutResend() {
+        // After a successful processor run with no outbound (the no-op
+        // logging() processor — used as the safe fallback in MeshRelay), the
+        // poller stamps a sentinel. A duplicate then short-circuits: no
+        // re-processing, and (because the sentinel has no payload) no
+        // outbound resend either.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        DedupCache cache = new DedupCache();
+        CountingProcessor proc = new CountingProcessor(); // does NOT populate cache
+        RecordingRelaySender relay = new RecordingRelaySender();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc, relay, cache);
+
+        String content = stampAction("fire and process silently", "macmini", "macmini:99:1");
+
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6200, 99L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+        assertEquals(1, proc.processCount.get());
+
+        // Sentinel must now be present (set by MessagePoller post-success).
+        DedupCache.DedupKey key = new DedupCache.DedupKey("macmini", 99L, "macmini:99:1");
+        assertTrue(cache.contains(key),
+            "sentinel must be installed after the processor returns successfully");
+        assertFalse(cache.get(key).hasResponse(),
+            "no real response was emitted — sentinel must reflect that");
+
+        // Duplicate inbound: must be silently dropped (no reprocess, no resend).
+        brain.drained = false;
+        brain.inbox.clear();
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6201, 99L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+
+        assertEquals(1, proc.processCount.get(),
+            "duplicate must NOT re-invoke the processor");
+        assertTrue(relay.sent.isEmpty(),
+            "sentinel duplicate must NOT trigger a resend (no payload to resend)");
+        assertTrue(brain.archived.contains(6201),
+            "duplicate is still archived");
+    }
+
+    @Test
+    @Timeout(10)
+    void prev12MessageWithoutSeqHeaderSkipsDedupAndProcesses() {
+        // A pre-v1.2 sender writes no seq= field. The dedup cache has no key
+        // to look up against, so the message must flow through normally.
+        // Both inbound copies must be processed (no dedup possible).
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        DedupCache cache = new DedupCache();
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc, RelaySender.NOOP, cache);
+
+        // No V12Fields → header carries no seq=
+        String content = RelayHandler.stampVersionHeader(
+            "legacy content", "macmini", "1.1.4", "action");
+
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6300, 33L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+        assertEquals(1, proc.processCount.get());
+
+        brain.drained = false;
+        brain.inbox.clear();
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6301, 33L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+
+        assertEquals(2, proc.processCount.get(),
+            "no seq_id ⇒ no dedup key ⇒ both copies must be processed");
+        assertEquals(0, cache.size(),
+            "cache must stay empty when inbound has no seq_id");
+    }
+
+    @Test
+    @Timeout(10)
+    void duplicateDoesNotCountTowardMaxTurnsCeiling() {
+        // The MAX_TURNS_PER_THREAD counter is incremented per non-progress
+        // dispatch. A duplicate short-circuits before that increment, so
+        // re-injecting the same seq_id 25 times against a cap of 20 must not
+        // wedge the thread.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        DedupCache cache = new DedupCache();
+        CachingTestProcessor proc = new CachingTestProcessor(cache);
+        RecordingRelaySender relay = new RecordingRelaySender();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc, relay, cache);
+
+        String content = stampAction("the same task", "macmini", "macmini:88:1");
+
+        // First poll: process once.
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6400, 88L, "macmini", "linuxserver", content, "pending"));
+        poller.triggerPoll();
+        assertEquals(1, proc.processCount.get());
+
+        // 25 duplicates over subsequent polls — would otherwise have driven
+        // the counter past MAX_TURNS_PER_THREAD (=20).
+        for (int i = 0; i < 25; i++) {
+            brain.drained = false;
+            brain.inbox.clear();
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                6500 + i, 88L, "macmini", "linuxserver", content, "pending"));
+            poller.triggerPoll();
+        }
+
+        assertEquals(1, proc.processCount.get(),
+            "duplicates must NEVER reach the processor regardless of count");
+        assertEquals(25, relay.sent.size(),
+            "each duplicate gets a cached resend (25 of them)");
     }
 
     @Test

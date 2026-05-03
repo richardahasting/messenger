@@ -88,6 +88,12 @@ public class MeshRelay {
         // ── OpenBrain + poller ────────────────────────────────────────────────
         OpenBrainStore brain = new OpenBrainStore(client, config);
 
+        // v1.2 dedup cache (issue #16). Shared between the poller (which reads
+        // it on each inbound to short-circuit duplicates) and the processors
+        // (which write the actual reply payload to it after sendReply). Created
+        // here so both halves of the pipeline reference the same instance.
+        DedupCache dedupCache = new DedupCache();
+
         // Processor selection — config.processor overrides auto-detection:
         //   "gemma"     → GemmaProcessor only (dedicated Ollama agent)
         //   "claude-cli"→ ClaudeCliProcessor only
@@ -95,14 +101,14 @@ public class MeshRelay {
         MessageProcessor processor;
         if ("gemma".equals(config.processor)) {
             log.info("Processor forced to Gemma via config");
-            processor = GemmaProcessor.create(client, config);
+            processor = GemmaProcessor.create(client, config, dedupCache);
             if (processor == null) {
                 log.severe("processor=gemma requested but Ollama is unreachable — exiting.");
                 System.exit(1);
             }
         } else if ("claude-cli".equals(config.processor)) {
             log.info("Processor forced to Claude CLI via config");
-            processor = ClaudeCliProcessor.create(client, config, brain);
+            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache);
             if (processor == null) {
                 log.severe("processor=claude-cli requested but claude binary not found — exiting.");
                 System.exit(1);
@@ -112,8 +118,8 @@ public class MeshRelay {
             //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
             //   2. GemmaProcessor     — local Ollama, works without internet
             //   3. logging()          — safe no-op fallback
-            processor = ClaudeCliProcessor.create(client, config, brain);
-            if (processor == null) processor = GemmaProcessor.create(client, config);
+            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache);
+            if (processor == null) processor = GemmaProcessor.create(client, config, dedupCache);
             if (processor == null) {
                 processor = MessageProcessor.logging();
                 // Loud warning — a node in logging-noop mode will poll messages,
@@ -134,7 +140,7 @@ public class MeshRelay {
         // auto-pong by POSTing to localhost:<listenPort>/relay so the outbound
         // path is identical to every other relay caller.
         RelaySender relaySender = new HttpRelaySender(client, config.listenPort);
-        MessagePoller poller = new MessagePoller(config, brain, processor, relaySender);
+        MessagePoller poller = new MessagePoller(config, brain, processor, relaySender, dedupCache);
         poller.startInBackground();
 
         // ── HTTP server ───────────────────────────────────────────────────────
