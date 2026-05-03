@@ -482,7 +482,8 @@ public class OpenBrainStore {
         String fromNode = msg.getString("from_node", "unknown");
         String toNode   = msg.getString("to_node",   "all");
         String content  = msg.getString("content",   "");
-        return new PendingMessage(id, threadId, fromNode, toNode, content);
+        String status   = msg.getString("status",    "pending");
+        return new PendingMessage(id, threadId, fromNode, toNode, content, status);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -503,5 +504,5 @@ public class OpenBrainStore {
      * messageId — the messages table row id (used for markDelivered / markArchived)
      * threadId  — conversation thread (used for per-thread serialization in MessagePoller)
      */
-    public record PendingMessage(int messageId, long threadId, String fromNode, String toNode, String content) {}
+    public record PendingMessage(int messageId, long threadId, String fromNode, String toNode, String content, String status) {}
 }

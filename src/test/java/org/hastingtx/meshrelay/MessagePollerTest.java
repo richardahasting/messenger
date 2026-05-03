@@ -113,16 +113,16 @@ class MessagePollerTest {
     @Test
     void isSelfBroadcastPredicate() {
         assertTrue(MessagePoller.isSelfBroadcast(
-            new OpenBrainStore.PendingMessage(1, 1L, "me", "all", "x"), "me"),
+            new OpenBrainStore.PendingMessage(1, 1L, "me", "all", "x", "pending"), "me"),
             "own broadcast must be flagged");
         assertFalse(MessagePoller.isSelfBroadcast(
-            new OpenBrainStore.PendingMessage(1, 1L, "peer", "all", "x"), "me"),
+            new OpenBrainStore.PendingMessage(1, 1L, "peer", "all", "x", "pending"), "me"),
             "peer broadcast must not be flagged");
         assertFalse(MessagePoller.isSelfBroadcast(
-            new OpenBrainStore.PendingMessage(1, 1L, "me", "peer", "x"), "me"),
+            new OpenBrainStore.PendingMessage(1, 1L, "me", "peer", "x", "pending"), "me"),
             "self-direct message must not be flagged");
         assertFalse(MessagePoller.isSelfBroadcast(
-            new OpenBrainStore.PendingMessage(1, 1L, "me", "me", "x"), "me"),
+            new OpenBrainStore.PendingMessage(1, 1L, "me", "me", "x", "pending"), "me"),
             "direct message to self (to=nodeName) must not be flagged");
     }
 
@@ -170,7 +170,7 @@ class MessagePollerTest {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            500, 500L, "linuxserver", "all", "my own broadcast"));
+            500, 500L, "linuxserver", "all", "my own broadcast", "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -192,7 +192,7 @@ class MessagePollerTest {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            501, 501L, "macmini", "all", "peer broadcast"));
+            501, 501L, "macmini", "all", "peer broadcast", "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -214,7 +214,7 @@ class MessagePollerTest {
         String ackContent = RelayHandler.stampVersionHeader(
             "Roger that. Good rollout.", "macmini", "1.1.3", "ack");
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            700, 700L, "macmini", "linuxserver", ackContent));
+            700, 700L, "macmini", "linuxserver", ackContent, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -237,7 +237,7 @@ class MessagePollerTest {
             "FYI: macmini disk at 70% — no action needed.",
             "macmini", "1.1.3", "info");
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            701, 701L, "macmini", "linuxserver", infoContent));
+            701, 701L, "macmini", "linuxserver", infoContent, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -256,7 +256,7 @@ class MessagePollerTest {
         String actionContent = RelayHandler.stampVersionHeader(
             "please restart foo", "macmini", "1.1.3", "action");
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            702, 702L, "macmini", "linuxserver", actionContent));
+            702, 702L, "macmini", "linuxserver", actionContent, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -274,7 +274,7 @@ class MessagePollerTest {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            703, 703L, "macmini", "linuxserver", "plain legacy content"));
+            703, 703L, "macmini", "linuxserver", "plain legacy content", "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
@@ -286,13 +286,55 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
+    void archivedMessageIsSkippedWithoutMarkDelivered() {
+        // Regression: get_inbox returns messages of all statuses. The daemon must not
+        // call markDelivered on an already-archived message — that overwrites archived→delivered
+        // and causes a redelivery loop. Reported by macbook-air on 2026-04-30 (message 466).
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            800, 800L, "macmini", "linuxserver", "action content", "archived"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "archived messages must not reach the processor");
+        assertTrue(brain.delivered.isEmpty(),
+            "must not call markDelivered on archived — overwrites status backward");
+        assertTrue(brain.archived.isEmpty(),
+            "must not re-archive an already-archived message");
+    }
+
+    @Test
+    @Timeout(10)
+    void deliveredMessageIsAlsoSkipped() {
+        // A message already claimed by another poll cycle (status=delivered) must not
+        // be re-processed. Same guard as the archived case.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            801, 801L, "macmini", "linuxserver", "action content", "delivered"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "in-flight (delivered) messages must not be double-processed");
+        assertTrue(brain.delivered.isEmpty());
+    }
+
+    @Test
+    @Timeout(10)
     void mixedInboxProcessesPeerMessagesAndSkipsSelfBroadcast() {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            600, 600L, "linuxserver", "all", "self broadcast — should be skipped"));
+            600, 600L, "linuxserver", "all", "self broadcast — should be skipped", "pending"));
         brain.inbox.add(new OpenBrainStore.PendingMessage(
-            601, 601L, "macmini", "linuxserver", "direct from peer — must run"));
+            601, 601L, "macmini", "linuxserver", "direct from peer — must run", "pending"));
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);

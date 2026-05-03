@@ -171,6 +171,18 @@ public class MessagePoller implements Runnable {
         log.info("Poll found " + pending.size() + " pending message(s)");
 
         for (OpenBrainStore.PendingMessage msg : pending) {
+            if (!"pending".equals(msg.status())) {
+                // get_inbox returns all messages regardless of status. Skip anything
+                // not in "pending" — calling markDelivered on an archived message
+                // overwrites the status backward (archived → delivered), which causes
+                // the redelivery loop macbook-air reported on 2026-04-30.
+                log.info("Skipping non-pending message: status=" + msg.status()
+                    + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId());
+                if ("all".equals(msg.toNode())) {
+                    brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                }
+                continue;
+            }
             if (isSelfBroadcast(msg, config.nodeName)) {
                 // Broadcast originated from this node — we already wrote the
                 // content; don't re-process our own output as inbound work.
