@@ -8,11 +8,13 @@ import java.net.http.HttpClient;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.logging.Logger;
+import java.util.stream.Stream;
 
 /**
  * agent-mesh-relay — claim-check message relay daemon.
@@ -94,6 +96,22 @@ public class MeshRelay {
         // here so both halves of the pipeline reference the same instance.
         DedupCache dedupCache = new DedupCache();
 
+        // v1.2 progress beats (issue #17). Wipe any stale per-thread log files
+        // left from a prior daemon run; in-flight conversations did not survive
+        // the restart, so resurrecting their tail bytes would lie to the peer.
+        // The runtime directory itself is created by systemd via
+        // RuntimeDirectory=messenger/progress (see messenger.service); on dev
+        // boxes / macOS the directory may not exist, in which case skip silently.
+        cleanupProgressDir(ClaudeCliProcessor.PROGRESS_DIR);
+
+        // RelaySender is shared between the ping auto-pong (issue #14) and the
+        // progress-beat scheduler (issue #17): both POST to localhost/relay so
+        // outbound progress and pong messages traverse the same code path as
+        // every other relay caller.
+        RelaySender relaySender = new HttpRelaySender(client, config.listenPort);
+        ProgressBeatScheduler progressBeatScheduler = new ProgressBeatScheduler(
+            relaySender, config.nodeName);
+
         // Processor selection — config.processor overrides auto-detection:
         //   "gemma"     → GemmaProcessor only (dedicated Ollama agent)
         //   "claude-cli"→ ClaudeCliProcessor only
@@ -108,7 +126,7 @@ public class MeshRelay {
             }
         } else if ("claude-cli".equals(config.processor)) {
             log.info("Processor forced to Claude CLI via config");
-            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache);
+            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache, progressBeatScheduler);
             if (processor == null) {
                 log.severe("processor=claude-cli requested but claude binary not found — exiting.");
                 System.exit(1);
@@ -118,7 +136,7 @@ public class MeshRelay {
             //   1. ClaudeCliProcessor — claude -p CLI, uses subscription (free), full tool use
             //   2. GemmaProcessor     — local Ollama, works without internet
             //   3. logging()          — safe no-op fallback
-            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache);
+            processor = ClaudeCliProcessor.create(client, config, brain, dedupCache, progressBeatScheduler);
             if (processor == null) processor = GemmaProcessor.create(client, config, dedupCache);
             if (processor == null) {
                 processor = MessageProcessor.logging();
@@ -136,10 +154,6 @@ public class MeshRelay {
         }
         log.info("Active processor: " + processor.name());
 
-        // Self-relay sender: the v1.2 ping handler (issue #14) emits its
-        // auto-pong by POSTing to localhost:<listenPort>/relay so the outbound
-        // path is identical to every other relay caller.
-        RelaySender relaySender = new HttpRelaySender(client, config.listenPort);
         MessagePoller poller = new MessagePoller(config, brain, processor, relaySender, dedupCache);
         poller.startInBackground();
 
@@ -177,5 +191,28 @@ public class MeshRelay {
             + " port=" + config.listenPort
             + " openBrain=" + config.openBrainUrl
             + " config_source=" + config.source);
+    }
+
+    /**
+     * Wipe stale per-thread progress logs from a previous daemon run (issue #17).
+     * In-flight conversations did not survive the restart, so resurrecting their
+     * tail bytes would lie to the peer. The directory itself is created by
+     * systemd via {@code RuntimeDirectory=messenger/progress}; on dev boxes /
+     * macOS the directory may be absent — silently skip in that case.
+     * Package-private for testing.
+     */
+    static void cleanupProgressDir(Path progressDir) {
+        if (progressDir == null || !Files.isDirectory(progressDir)) return;
+        try (Stream<Path> entries = Files.list(progressDir)) {
+            entries.forEach(p -> {
+                try { Files.deleteIfExists(p); }
+                catch (IOException e) {
+                    log.warning("Could not delete stale progress log " + p + ": " + e.getMessage());
+                }
+            });
+            log.info("Cleaned stale progress logs from " + progressDir);
+        } catch (IOException e) {
+            log.warning("Could not list progress dir " + progressDir + ": " + e.getMessage());
+        }
     }
 }

@@ -20,5 +20,12 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/home/richard
 
+# v1.2 progress beats (issue #17): per-thread log files live under
+# /run/messenger/progress (== /var/run/messenger/progress). systemd creates
+# this directory with mode 0755 owned by the service user on each start, and
+# wipes it on stop, so the daemon never has to manage permissions itself.
+RuntimeDirectory=messenger/progress
+RuntimeDirectoryMode=0755
+
 [Install]
 WantedBy=multi-user.target

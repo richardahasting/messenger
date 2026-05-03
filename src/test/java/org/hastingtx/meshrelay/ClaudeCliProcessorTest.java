@@ -2,7 +2,11 @@ package org.hastingtx.meshrelay;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -132,5 +136,73 @@ class ClaudeCliProcessorTest {
         assertFalse(ClaudeCliProcessor.isAcknowledgement(
             "The deploy completed at 14:32 UTC. All three nodes are reporting "
             + "healthy. Logs are clean — no errors in the last hour."));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v1.2 progress-beat helpers (issue #17). The end-to-end progress flow
+    // is exercised in ProgressBeatSchedulerTest; these focus on the parsing
+    // and path-construction helpers that ClaudeCliProcessor.process() uses
+    // to decide whether and where to set up the per-thread log.
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static String stampedHeader(Integer updateInterval, String seqId) {
+        RelayHandler.V12Fields v12 = new RelayHandler.V12Fields(
+            seqId, "REQ_ACK", "REPLY", null, updateInterval, null);
+        return RelayHandler.stampVersionHeader(
+            "do something interesting", "macmini", "1.2.0", "action", v12);
+    }
+
+    @Test
+    void parseUpdateInterval_returnsClampInputWhenPresent() {
+        // process() reads the raw value; ProgressBeatScheduler.start applies
+        // the [30, 120] clamp. Pinning the parser separately makes the
+        // clamp/parse split visible.
+        assertEquals(60, ClaudeCliProcessor.parseUpdateInterval(
+            stampedHeader(60, "macmini:42:1")));
+        assertEquals(45, ClaudeCliProcessor.parseUpdateInterval(
+            stampedHeader(45, "macmini:42:2")));
+    }
+
+    @Test
+    void parseUpdateInterval_returnsNullWhenAbsent() {
+        // Pre-v1.2 sender, or v1.2 sender that didn't request progress beats.
+        // null means "skip the progress-log setup entirely" in process().
+        RelayHandler.V12Fields noUpdate = new RelayHandler.V12Fields(
+            "macmini:42:3", "REQ_ACK", "REPLY", null, null, null);
+        String content = RelayHandler.stampVersionHeader(
+            "ping me", "macmini", "1.2.0", "action", noUpdate);
+        assertNull(ClaudeCliProcessor.parseUpdateInterval(content));
+    }
+
+    @Test
+    void parseUpdateInterval_returnsNullWhenHeaderMalformed() {
+        // Defensive: header field exists but isn't an integer. Returning null
+        // routes process() through the no-progress path instead of throwing.
+        String forged = "[messenger v1.2.0 from macmini update=NOT_AN_INT]\n\nbody";
+        assertNull(ClaudeCliProcessor.parseUpdateInterval(forged));
+    }
+
+    @Test
+    void parseUpdateInterval_returnsNullForLegacyHeaderlessContent() {
+        // Pre-v1.0 stored content with no version header at all.
+        assertNull(ClaudeCliProcessor.parseUpdateInterval("plain message body, no header"));
+        assertNull(ClaudeCliProcessor.parseUpdateInterval(null));
+    }
+
+    @Test
+    void progressLogPath_matchesSpecFormat() {
+        // Spec § "Receiver-side flow":
+        //   logPath = /var/run/messenger/progress/thread-<id>-seq-<seq>.log
+        Path p = ClaudeCliProcessor.progressLogPath(42L, "macmini:42:1");
+        assertEquals(Path.of("/var/run/messenger/progress/thread-42-seq-macmini:42:1.log"), p);
+    }
+
+    @Test
+    void progressLogPath_handlesNullSeq() {
+        // Defensive: process() guards against null seq before calling, but
+        // the helper itself must not blow up on null — used in error paths.
+        Path p = ClaudeCliProcessor.progressLogPath(7L, null);
+        assertTrue(p.toString().endsWith("thread-7-seq-0.log"),
+            "null seq → '0' placeholder so the helper is total: " + p);
     }
 }
