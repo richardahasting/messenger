@@ -250,6 +250,27 @@ public class RelayHandler implements HttpHandler {
      * Extract the kind from a stored content header. Returns "action" for messages
      * without a kind (including messages from old daemons that don't write the
      * kind suffix). Returns the parsed value otherwise.
+     *
+     * <p>Recognized v1.2 kinds (see docs/protocol-v1.2.md § "kind enum"):
+     * <ul>
+     *   <li>{@code action}   — runs the processor (Claude CLI, etc.). Default when
+     *       the header omits the kind field.</li>
+     *   <li>{@code reply}    — response payload to a prior {@code REQ_ACK}. Carries
+     *       {@code in_reply_to=&lt;seq_id&gt;}. Poller archives without invoking
+     *       the processor.</li>
+     *   <li>{@code ack}      — empty-payload delivery confirmation when a processor
+     *       produced no output. Archived without processor invocation.</li>
+     *   <li>{@code progress} — periodic liveness beat from a working processor.
+     *       Excluded from {@code MAX_TURNS_PER_THREAD}. Archived without
+     *       processor invocation.</li>
+     *   <li>{@code info}     — broadcasts and one-way notifications. Archived.</li>
+     *   <li>{@code ping}     — daemon-handled liveness probe. Daemon auto-responds
+     *       with a {@code kind=reply payload="pong"}. Never reaches Claude.</li>
+     * </ul>
+     *
+     * <p>Behavior is unchanged from the v1.1.x implementation — this method just
+     * returns whatever string is in the header; dispatch decisions live in
+     * {@link MessagePoller}.
      */
     public static String extractKind(String content) {
         return extractHeaderField(content, "kind", "action");

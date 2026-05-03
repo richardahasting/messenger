@@ -326,6 +326,116 @@ class MessagePollerTest {
         assertTrue(brain.delivered.isEmpty());
     }
 
+    // ── v1.2 kind enum dispatch (issue #13) ──────────────────────────────
+
+    @Test
+    @Timeout(10)
+    void replyMessageBypassesProcessor() {
+        // kind=reply carries a response payload to a prior REQ_ACK. Poller
+        // archives without invoking the processor — full waiter delivery
+        // arrives in issue #17 (dedup cache).
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String replyContent = RelayHandler.stampVersionHeader(
+            "907 ft, 99.8% full", "macmini", "1.2.0", "reply");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            900, 900L, "macmini", "linuxserver", replyContent, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "reply messages must not reach the processor");
+        assertEquals(List.of(900), brain.archived);
+        assertTrue(brain.delivered.isEmpty());
+    }
+
+    @Test
+    @Timeout(10)
+    void progressMessageBypassesProcessor() {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String progressContent = RelayHandler.stampVersionHeader(
+            "(no log activity)", "macmini", "1.2.0", "progress");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            901, 901L, "macmini", "linuxserver", progressContent, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "progress beats must never run the processor");
+        assertEquals(List.of(901), brain.archived);
+    }
+
+    @Test
+    @Timeout(10)
+    void pingMessageBypassesProcessor() {
+        // ping is daemon-handled — the auto-pong response arrives in issue #15.
+        // For now (issue #13) the poller archives without invoking Claude.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String pingContent = RelayHandler.stampVersionHeader(
+            "", "macmini", "1.2.0", "ping");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            902, 902L, "macmini", "linuxserver", pingContent, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "ping must not run Claude — daemon handles it directly (issue #15)");
+        assertEquals(List.of(902), brain.archived);
+    }
+
+    @Test
+    @Timeout(10)
+    void unknownKindArchivesDefensivelyWithoutProcessor() {
+        // Acceptance: unknown kinds don't crash the poller — they archive
+        // with a warning. This is defense-in-depth against protocol-version
+        // drift (e.g. a peer running a future v1.3 kind we haven't taught
+        // this daemon yet).
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String fnordContent = RelayHandler.stampVersionHeader(
+            "what even is this", "macmini", "1.2.0", "fnord");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            903, 903L, "macmini", "linuxserver", fnordContent, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        assertDoesNotThrow(poller::triggerPoll,
+            "unknown kinds must never throw out of the poll loop");
+
+        assertEquals(0, proc.processCount.get(),
+            "unknown kinds must not invoke the processor");
+        assertEquals(List.of(903), brain.archived,
+            "unknown kinds must still be archived so they don't reappear");
+    }
+
+    @Test
+    void isKnownNonActionKindRecognisesV12Set() {
+        assertTrue(MessagePoller.isKnownNonActionKind("reply"));
+        assertTrue(MessagePoller.isKnownNonActionKind("ack"));
+        assertTrue(MessagePoller.isKnownNonActionKind("info"));
+        assertTrue(MessagePoller.isKnownNonActionKind("progress"));
+        assertTrue(MessagePoller.isKnownNonActionKind("ping"));
+        assertFalse(MessagePoller.isKnownNonActionKind("fnord"));
+        assertFalse(MessagePoller.isKnownNonActionKind(""));
+        // "action" is not "non-action" — predicate is about the bypass set only
+        assertFalse(MessagePoller.isKnownNonActionKind("action"));
+    }
+
+    @Test
+    void maxTurnsPerThreadConstantIsTwenty() {
+        // Stub for v1.2.0 (2/9). Enforcement lands in issue #14;
+        // this assertion guards against silent retuning of the ceiling.
+        assertEquals(20, MessagePoller.MAX_TURNS_PER_THREAD);
+    }
+
     @Test
     @Timeout(10)
     void mixedInboxProcessesPeerMessagesAndSkipsSelfBroadcast() {

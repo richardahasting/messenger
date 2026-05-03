@@ -38,6 +38,19 @@ public class MessagePoller implements Runnable {
     private static final Logger   log           = Logger.getLogger(MessagePoller.class.getName());
     static final Duration POLL_INTERVAL = Duration.ofMinutes(10);
 
+    /**
+     * Backstop ceiling on processor invocations per thread (see
+     * docs/protocol-v1.2.md § "Backstop: max-turns ceiling").
+     *
+     * Defense-in-depth: if a future {@code kind} is introduced without analysing
+     * its loop properties, this ceiling caps the runaway. {@code kind=progress}
+     * is excluded from the count — a 1-hour task at 30s beats produces ~120
+     * progress messages, which would otherwise trip the ceiling.
+     *
+     * Stub for v1.2.0 (2/9). Enforcement is added in issue #14.
+     */
+    static final int MAX_TURNS_PER_THREAD = 20;
+
     private final PeerConfig       config;
     private final OpenBrainStore   brain;
     private final MessageProcessor processor;
@@ -196,15 +209,26 @@ public class MessagePoller implements Runnable {
             }
             String kind = RelayHandler.extractKind(msg.content());
             if (!"action".equals(kind)) {
-                // ack / info messages don't need processor invocation — they're
-                // non-actionable signals. Archive immediately so we don't spawn
+                // Non-action kinds don't run the processor — they're either
+                // protocol signals (ack, reply, progress, ping) or one-way
+                // notifications (info). Archive immediately so we don't spawn
                 // a Claude CLI session just to "reply" to an acknowledgment.
                 // This is what broke the poller with the 11h zombie: linuxserver
                 // was running claude -p against an ack message whose content
                 // was literally "Roger that. Good rollout."
-                log.info("Skipping non-action message: kind=" + kind
-                    + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId()
-                    + " from=" + msg.fromNode());
+                //
+                // ping is a stub at this stage — full daemon-handled pong reply
+                // is implemented in issue #15. reply→waiter delivery (dedup
+                // cache notification) lands in issue #17.
+                if (isKnownNonActionKind(kind)) {
+                    log.info("Skipping non-action message: kind=" + kind
+                        + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId()
+                        + " from=" + msg.fromNode());
+                } else {
+                    log.warning("Unknown kind — archiving defensively: kind=" + kind
+                        + " message_id=" + msg.messageId() + " thread_id=" + msg.threadId()
+                        + " from=" + msg.fromNode());
+                }
                 brain.markArchived(msg.messageId());
                 if ("all".equals(msg.toNode())) {
                     brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
@@ -228,6 +252,20 @@ public class MessagePoller implements Runnable {
      */
     static boolean isSelfBroadcast(OpenBrainStore.PendingMessage msg, String nodeName) {
         return "all".equals(msg.toNode()) && nodeName.equals(msg.fromNode());
+    }
+
+    /**
+     * True for v1.2 kinds that the poller recognises but does not run through
+     * the processor: {@code reply}, {@code ack}, {@code info}, {@code progress},
+     * {@code ping}. Any other non-action value is treated as unknown and logged
+     * as a warning (defensive archive — defends against protocol-version drift).
+     * Package-private for testing.
+     */
+    static boolean isKnownNonActionKind(String kind) {
+        return switch (kind) {
+            case "reply", "ack", "info", "progress", "ping" -> true;
+            default -> false;
+        };
     }
 
     /**
