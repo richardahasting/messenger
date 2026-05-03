@@ -132,6 +132,23 @@ test_doom_loop() {
 # v1.2 makes this deterministic — exactly 2 messages (ping + pong), stable.
 # Any growth means the receiver fell back to Claude or a peer ack-loop crept
 # back in.
+#
+# Choice: STRICT (len1==2 && len2==2). Three options were considered:
+#   • STRICT  — len1==2 && len2==2
+#   • BOUNDED — len1<=4 && len2==len1
+#   • STABLE  — len1==len2 (any size, just must not grow)
+#
+# STRICT is chosen because the spec's loop-prevention guarantee
+# (docs/protocol-v1.2.md § "Loop-prevention guarantee") is exact, not
+# bounded: "a single Q&A turn terminates in exactly 2 messages." A larger
+# observed length would mean either (a) the daemon fell back to running
+# Claude on a ping (issue #14 regression), or (b) a peer ack-loop crept in
+# under v1.1.x semantics. BOUNDED would mask such regressions until they
+# escaped the bound; STABLE would mask them entirely. STRICT trades
+# brittleness against scheduling jitter for early detection of any
+# regression — and v1.2's daemon-handled ping makes scheduling jitter
+# irrelevant (the pong is emitted synchronously inside handlePing before
+# the inbound ping is archived).
 # ────────────────────────────────────────────────────────────────────────────
 assert_doom_loop_resolved() {
     local tid="$1" len1="$2" len2="$3"
@@ -257,6 +274,326 @@ test_unit_suite() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+# v1.2 protocol coverage — Tests 6-11 exercise the new mechanisms added in
+# issues #12-#17 against the live mesh. Each posts to /relay (loopback) and
+# inspects journal/OpenBrain to confirm the wire-level invariants.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Helper: send a /relay POST with v1.2 fields. Caller passes a JSON object as
+# extra fields (e.g. '"seq_id":"a:1:1","ack_policy":"REQ_ACK"'). Echoes the
+# JSON response.
+v12_relay_post() {
+    local to="$1" from="$2" content="$3" kind="$4" extra="${5:-}"
+    local body
+    body=$(jq -n \
+        --arg to "$to" --arg from "$from" \
+        --arg content "$content" --arg kind "$kind" \
+        '{to:$to, from:$from, content:$content, kind:$kind}')
+    if [[ -n "$extra" ]]; then
+        # Merge raw extra fields into the object (jq's `+` for two objects).
+        body=$(echo "$body" | jq ". + {${extra}}")
+    fi
+    curl -s -X POST "${DAEMON_URL}/relay" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 6 — kind=ping round-trip with latency budget (issue #14)
+#
+# Acceptance: kind=reply payload="pong" arrives quickly and the journal
+# never shows a Claude invocation for the ping. Test 1 above checks the
+# 2-message stability invariant; Test 6 checks the daemon's auto-pong
+# emission is sub-second on the local mesh.
+# ════════════════════════════════════════════════════════════════════════════
+test_ping_latency() {
+    hdr "Test 6: kind=ping → pong arrives quickly, no Claude invoked"
+    local since_marker; since_marker=$(date -Iseconds)
+
+    local resp tid t_start t_end elapsed_ms
+    t_start=$(date +%s%3N)
+    resp=$(relay_post "$PEER_NODE" "$SELF_NODE" "" "ping")
+    tid=$(echo "$resp" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "ping POST failed (resp: $resp)"
+        return
+    fi
+
+    # Daemon-handled pong is emitted synchronously inside handlePing on the
+    # *receiver*. The full round-trip includes a wake-up ping and an
+    # OpenBrain write on each side. Sub-second is realistic on LAN; we
+    # assert <2000ms to absorb scheduling jitter while still flagging any
+    # accidental fall-through to Claude (which would be 30-300s).
+    local len; len=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.2
+        len=$(thread_len "$tid")
+        [[ "$len" == "2" ]] && break
+    done
+    t_end=$(date +%s%3N)
+    elapsed_ms=$((t_end - t_start))
+
+    if [[ "$len" == "2" ]]; then
+        record_pass "ping → pong reached 2 messages in ${elapsed_ms}ms"
+    else
+        record_fail "ping → pong did not reach 2 messages within 2s (len=$len)"
+    fi
+
+    if (( elapsed_ms < 2000 )); then
+        record_pass "ping latency under 2s budget (${elapsed_ms}ms)"
+    else
+        record_fail "ping latency exceeded 2s budget (${elapsed_ms}ms)"
+    fi
+
+    # Belt-and-braces: NO Claude session should have been spawned for this
+    # thread. The journal would show "Processed message thread_id=$tid" if
+    # the processor ran.
+    if recent_journal "$since_marker" | grep -q "Processed message thread_id=$tid"; then
+        record_fail "Claude was invoked on ping thread $tid (found 'Processed message')"
+    else
+        record_pass "no 'Processed message' for ping thread $tid — daemon handled it"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 7 — multi-turn: two sequential REQ_ACK on one thread = 4 messages
+#
+# Spec § "Multi-turn conversations": reply_policy=NO_REPLY is per-MESSAGE,
+# not per-thread. Sending two REQ_ACK actions on the same thread_id should
+# yield exactly:
+#   action_1, reply_1, action_2, reply_2  (4 messages total)
+# Anything more = a peer auto-responded to the reply (loop regression).
+# ════════════════════════════════════════════════════════════════════════════
+test_multi_turn() {
+    hdr "Test 7: two sequential REQ_ACK turns on one thread → exactly 4 messages"
+
+    # Turn 1 — opens the thread.
+    local resp1 tid
+    resp1=$(relay_post "$PEER_NODE" "$SELF_NODE" "ping (turn 1)" "ping")
+    tid=$(echo "$resp1" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "could not open multi-turn thread (resp: $resp1)"
+        return
+    fi
+    yellow "  Thread $tid opened with turn 1; sleeping 5s for pong…"
+    sleep 5
+
+    # Turn 2 — same thread, second REQ_ACK. Use thread_id to keep them stitched.
+    local resp2
+    resp2=$(curl -s -X POST "${DAEMON_URL}/relay" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg to "$PEER_NODE" --arg from "$SELF_NODE" \
+            --arg content "ping (turn 2)" --arg kind "ping" --argjson tid "$tid" \
+            '{to:$to, from:$from, content:$content, kind:$kind, thread_id:$tid}')")
+    yellow "  Turn 2 posted to thread $tid; sleeping 5s for second pong…"
+    sleep 5
+
+    local len; len=$(thread_len "$tid")
+    if [[ "$len" == "4" ]]; then
+        record_pass "thread $tid has exactly 4 messages — multi-turn closed cleanly"
+    else
+        record_fail "thread $tid has $len messages — expected 4 (action,reply,action,reply)"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 8 — MAX_TURNS_PER_THREAD ceiling (issue #15)
+#
+# Spec § "Backstop: max-turns ceiling": the 21st non-progress message on
+# a thread is dropped with a warning. Defense-in-depth — counters reset on
+# daemon restart, so this test must run within one daemon lifetime.
+#
+# Sending 21 wire messages serially is slow; we use kind=info (NO_ACK,
+# NO_REPLY) so each message is a single archive operation rather than a
+# Claude round-trip.
+# ════════════════════════════════════════════════════════════════════════════
+test_max_turns() {
+    hdr "Test 8: 21st non-progress message on one thread is dropped (MAX_TURNS=20)"
+    local since_marker; since_marker=$(date -Iseconds)
+
+    # Open the thread with the first message.
+    local resp tid
+    resp=$(relay_post "$SELF_NODE" "$SELF_NODE" "max-turns probe 1" "info")
+    tid=$(echo "$resp" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "could not open MAX_TURNS thread (resp: $resp)"
+        return
+    fi
+
+    # Send 19 more messages on the same thread → total of 20 sent.
+    local i
+    for i in $(seq 2 20); do
+        curl -s -X POST "${DAEMON_URL}/relay" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg to "$SELF_NODE" --arg from "$SELF_NODE" \
+                --arg content "max-turns probe $i" --arg kind "info" \
+                --argjson tid "$tid" \
+                '{to:$to, from:$from, content:$content, kind:$kind, thread_id:$tid}')" \
+            >/dev/null
+    done
+    yellow "  Sent 20 info messages on thread $tid; sleeping 30s for them to drain…"
+    sleep 30
+
+    # The 21st should trip the ceiling.
+    curl -s -X POST "${DAEMON_URL}/relay" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg to "$SELF_NODE" --arg from "$SELF_NODE" \
+            --arg content "max-turns probe 21 (should be dropped)" --arg kind "info" \
+            --argjson tid "$tid" \
+            '{to:$to, from:$from, content:$content, kind:$kind, thread_id:$tid}')" \
+        >/dev/null
+    yellow "  Sent 21st message; sleeping 15s for poller to see it…"
+    sleep 15
+
+    if recent_journal "$since_marker" | grep -q "Thread cap (>20) exceeded"; then
+        record_pass "journal shows 'Thread cap (>20) exceeded' warning"
+    else
+        record_fail "journal missing MAX_TURNS warning — 21st message not dropped"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 9 — dedup cache (issue #16)
+#
+# Spec § "Receiver behavior" step 2: a duplicate (from, thread, seq_id)
+# replays the cached response without re-invoking the processor. Daemon-
+# local cache, so this test must run within one daemon lifetime.
+# ════════════════════════════════════════════════════════════════════════════
+test_dedup() {
+    hdr "Test 9: duplicate seq_id triggers cached response, processor invocation count stays at 1"
+    local since_marker; since_marker=$(date -Iseconds)
+
+    # First post — establishes the cache entry. We use kind=ping because the
+    # daemon caches the auto-pong; this avoids the test depending on Claude.
+    local fixed_seq; fixed_seq="dedup-test-$(date +%s):0"
+    local resp1 tid
+    resp1=$(v12_relay_post "$PEER_NODE" "$SELF_NODE" "dedup probe" "ping" \
+        "\"seq_id\":\"$fixed_seq\"")
+    tid=$(echo "$resp1" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "could not open dedup thread (resp: $resp1)"
+        return
+    fi
+    yellow "  First ping posted (seq=$fixed_seq, thread=$tid); sleeping 10s…"
+    sleep 10
+
+    # Second post — same seq_id, same thread. Must hit the cache.
+    curl -s -X POST "${DAEMON_URL}/relay" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg to "$PEER_NODE" --arg from "$SELF_NODE" \
+            --arg content "dedup probe (duplicate)" --arg kind "ping" \
+            --arg seq "$fixed_seq" --argjson tid "$tid" \
+            '{to:$to, from:$from, content:$content, kind:$kind, seq_id:$seq, thread_id:$tid}')" \
+        >/dev/null
+    yellow "  Duplicate ping posted; sleeping 10s for dedup hit to land…"
+    sleep 10
+
+    if recent_journal "$since_marker" | grep -qE "Dedup hit.*seq=$fixed_seq"; then
+        record_pass "journal shows 'Dedup hit' for seq=$fixed_seq"
+    else
+        record_fail "journal missing dedup hit for seq=$fixed_seq since $since_marker"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 10 — progress mechanism (issue #17)
+#
+# Spec § "Progress mechanism — daemon-driven heartbeat with log tailing":
+# kind=action with update_interval_seconds=30 must trigger at least one
+# kind=progress message while the processor runs, and the per-thread log
+# file must be removed after the processor exits.
+# ════════════════════════════════════════════════════════════════════════════
+test_progress() {
+    hdr "Test 10: action with update_interval_seconds=30 emits kind=progress, log file cleaned up"
+    local since_marker; since_marker=$(date -Iseconds)
+
+    # Long task: ask Claude to recite a longish but bounded response. The
+    # progress log will be populated by the PostToolUse hook and tee
+    # invocations the system prompt instructs.
+    local resp tid
+    resp=$(v12_relay_post "$SELF_NODE" "$SELF_NODE" \
+        "List five facts about the Canyon Lake Texas reservoir, one per line." \
+        "action" \
+        '"update_interval_seconds":30')
+    tid=$(echo "$resp" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "could not open progress test thread (resp: $resp)"
+        return
+    fi
+    yellow "  Thread $tid started with update_interval_seconds=30; sleeping 90s…"
+    sleep 90
+
+    # Look for at least one kind=progress in the thread.
+    local progress_count
+    progress_count=$(curl -s "${OPENBRAIN_URL}/api/messages?thread_id=${tid}" \
+        | jq '[.[] | select(.content | test("kind=progress"))] | length' 2>/dev/null \
+        || echo 0)
+    if (( progress_count >= 1 )); then
+        record_pass "thread $tid received $progress_count progress beat(s)"
+    else
+        record_fail "thread $tid received 0 progress beats — heartbeat not firing"
+    fi
+
+    # Log file cleanup: per-thread file should NOT exist after the reply lands.
+    local log_path="/var/run/messenger/progress/thread-${tid}-seq-1.log"
+    if [[ -e "$log_path" ]]; then
+        record_fail "progress log $log_path still exists after task completion"
+    else
+        record_pass "progress log $log_path removed after task completion"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 11 — secrets sweep on progress payloads (issue #17)
+#
+# Spec § "Progress mechanism" / "Constraints": "Daemon performs a secrets
+# sweep on each tail before sending: lines matching common credential
+# patterns (.*_TOKEN=, .*_KEY=, Authorization:, password=) are redacted to
+# <redacted>." This test forces a credential-shaped line into the payload
+# and asserts none of it appears in the kind=progress emitted to the wire.
+# ════════════════════════════════════════════════════════════════════════════
+test_secrets_sweep() {
+    hdr "Test 11: API_TOKEN=abc123 in payload appears as <redacted> in kind=progress"
+
+    # Long-enough task that progress beats fire AND the secret-shaped string
+    # ends up in the progress log via the system prompt's tee directive.
+    local resp tid
+    resp=$(v12_relay_post "$SELF_NODE" "$SELF_NODE" \
+        "Run: echo API_TOKEN=abc123 | tee -a \$MESSENGER_PROGRESS_LOG; sleep 1; echo done" \
+        "action" \
+        '"update_interval_seconds":30')
+    tid=$(echo "$resp" | jq -r '.thread_id // empty')
+    if [[ -z "$tid" ]]; then
+        record_fail "could not open secrets-sweep thread (resp: $resp)"
+        return
+    fi
+    yellow "  Thread $tid started; sleeping 90s for progress beat…"
+    sleep 90
+
+    # Pull the kind=progress payloads and check for redaction.
+    local progress_payloads
+    progress_payloads=$(curl -s "${OPENBRAIN_URL}/api/messages?thread_id=${tid}" \
+        | jq -r '.[] | select(.content | test("kind=progress")) | .content')
+
+    if [[ -z "$progress_payloads" ]]; then
+        record_fail "no kind=progress messages on thread $tid — sweep cannot be verified"
+        return
+    fi
+
+    if echo "$progress_payloads" | grep -q "abc123"; then
+        record_fail "raw secret 'abc123' leaked into kind=progress payload"
+    else
+        record_pass "no raw 'abc123' in any kind=progress payload"
+    fi
+
+    if echo "$progress_payloads" | grep -q "<redacted>"; then
+        record_pass "kind=progress payload contains '<redacted>' marker"
+    else
+        record_fail "no '<redacted>' marker in kind=progress payloads — sweep not firing"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
 main() {
     test_health
     test_doom_loop
@@ -264,6 +601,12 @@ main() {
     test_kind_short_circuit
     test_status_guard
     test_unit_suite
+    test_ping_latency
+    test_multi_turn
+    test_max_turns
+    test_dedup
+    test_progress
+    test_secrets_sweep
 
     hdr "Summary"
     echo "  Passed: $PASS"
