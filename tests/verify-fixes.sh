@@ -40,11 +40,31 @@ relay_post() {
             '{to:$to, from:$from, content:$content, kind:$kind}')"
 }
 
-# Helper: count messages in a thread via OpenBrain.
+# Helper: count messages in a thread via OpenBrain MCP.
+# OpenBrain doesn't expose /api/messages directly; threads are queried via the
+# MCP interface that the daemon itself uses. We pull the key from the
+# daemon's .env so the script doesn't need a separate credential.
 thread_len() {
     local tid="$1"
-    curl -s "${OPENBRAIN_URL}/api/messages?thread_id=${tid}" \
+    local key
+    key=$(grep -E '^OPENBRAIN_KEY=' "${REPO}/.env" 2>/dev/null | cut -d= -f2-)
+    curl -s -X POST "${OPENBRAIN_URL}/mcp" \
+        -H 'Content-Type: application/json' \
+        -H "x-brain-key: ${key}" \
+        -d "{\"tool\":\"get_thread\",\"thread_id\":${tid}}" \
         | jq 'length' 2>/dev/null || echo "ERR"
+}
+
+# Helper: dump a thread's content array (one item per message). Used by tests
+# 10/11 to scan for kind=progress payloads.
+thread_contents() {
+    local tid="$1"
+    local key
+    key=$(grep -E '^OPENBRAIN_KEY=' "${REPO}/.env" 2>/dev/null | cut -d= -f2-)
+    curl -s -X POST "${OPENBRAIN_URL}/mcp" \
+        -H 'Content-Type: application/json' \
+        -H "x-brain-key: ${key}" \
+        -d "{\"tool\":\"get_thread\",\"thread_id\":${tid}}"
 }
 
 # Helper: pull the last n lines of journal for the messenger service.
@@ -58,14 +78,14 @@ recent_journal() {
 # Test 0 — daemon liveness and version sanity
 # ════════════════════════════════════════════════════════════════════════════
 test_health() {
-    hdr "Test 0: /health reports v1.1.6, processor=claude-cli"
+    hdr "Test 0: /health reports v1.2.0, processor=claude-cli"
     local body version processor
     body=$(curl -s "${DAEMON_URL}/health") || { record_fail "health unreachable"; return; }
     version=$(echo "$body" | jq -r '.version')
     processor=$(echo "$body" | jq -r '.processor')
 
-    [[ "$version" == "1.1.6" ]] \
-        && record_pass "version=1.1.6" \
+    [[ "$version" == "1.2.0" ]] \
+        && record_pass "version=1.2.0" \
         || record_fail "version mismatch (got: $version)"
 
     [[ "$processor" == "claude-cli" ]] \
@@ -93,10 +113,10 @@ test_doom_loop() {
 
     local since_marker; since_marker=$(date -Iseconds)
 
-    # Send kind=ping to a peer; payload is irrelevant — daemon ignores it
-    # and auto-responds with "pong".
+    # Send kind=ping to a peer; payload is wire-required (non-empty) but
+    # semantically ignored — daemon auto-responds with "pong".
     local resp tid
-    resp=$(relay_post "$PEER_NODE" "$SELF_NODE" "" "ping")
+    resp=$(relay_post "$PEER_NODE" "$SELF_NODE" "ping" "ping")
     tid=$(echo "$resp" | jq -r '.thread_id // empty')
     if [[ -z "$tid" ]]; then
         record_fail "could not start ping thread (resp: $resp)"
@@ -169,7 +189,8 @@ test_input_filter() {
     since_marker=$(date -Iseconds)
 
     local resp tid
-    resp=$(relay_post "$SELF_NODE" "$ECHO_NODE" "noop — ack received" "ack")
+    resp=$(v12_relay_post "$SELF_NODE" "$ECHO_NODE" "noop — ack received" "ack" \
+        '"in_reply_to":"verify-fixes:0"')
     tid=$(echo "$resp" | jq -r '.thread_id // empty')
     if [[ -z "$tid" ]]; then
         record_fail "input-filter: could not POST (resp: $resp)"
@@ -215,7 +236,8 @@ test_kind_short_circuit() {
     local since_marker; since_marker=$(date -Iseconds)
 
     local resp tid
-    resp=$(relay_post "$SELF_NODE" "$ECHO_NODE" "diagnostic ping — ignore" "ack")
+    resp=$(v12_relay_post "$SELF_NODE" "$ECHO_NODE" "diagnostic ping — ignore" "ack" \
+        '"in_reply_to":"verify-fixes:0"')
     tid=$(echo "$resp" | jq -r '.thread_id // empty')
     if [[ -z "$tid" ]]; then
         record_fail "kind=ack: could not POST (resp: $resp)"
@@ -312,7 +334,7 @@ test_ping_latency() {
 
     local resp tid t_start t_end elapsed_ms
     t_start=$(date +%s%3N)
-    resp=$(relay_post "$PEER_NODE" "$SELF_NODE" "" "ping")
+    resp=$(relay_post "$PEER_NODE" "$SELF_NODE" "ping" "ping")
     tid=$(echo "$resp" | jq -r '.thread_id // empty')
     if [[ -z "$tid" ]]; then
         record_fail "ping POST failed (resp: $resp)"
@@ -411,9 +433,11 @@ test_max_turns() {
     hdr "Test 8: 21st non-progress message on one thread is dropped (MAX_TURNS=20)"
     local since_marker; since_marker=$(date -Iseconds)
 
-    # Open the thread with the first message.
+    # Open the thread with the first message. from=PEER_NODE because the
+    # daemon doesn't accept itself as a "from" peer (linuxserver isn't in
+    # its own peer list).
     local resp tid
-    resp=$(relay_post "$SELF_NODE" "$SELF_NODE" "max-turns probe 1" "info")
+    resp=$(relay_post "$SELF_NODE" "$PEER_NODE" "max-turns probe 1" "info")
     tid=$(echo "$resp" | jq -r '.thread_id // empty')
     if [[ -z "$tid" ]]; then
         record_fail "could not open MAX_TURNS thread (resp: $resp)"
@@ -425,7 +449,7 @@ test_max_turns() {
     for i in $(seq 2 20); do
         curl -s -X POST "${DAEMON_URL}/relay" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg to "$SELF_NODE" --arg from "$SELF_NODE" \
+            -d "$(jq -n --arg to "$SELF_NODE" --arg from "$PEER_NODE" \
                 --arg content "max-turns probe $i" --arg kind "info" \
                 --argjson tid "$tid" \
                 '{to:$to, from:$from, content:$content, kind:$kind, thread_id:$tid}')" \
@@ -437,7 +461,7 @@ test_max_turns() {
     # The 21st should trip the ceiling.
     curl -s -X POST "${DAEMON_URL}/relay" \
         -H "Content-Type: application/json" \
-        -d "$(jq -n --arg to "$SELF_NODE" --arg from "$SELF_NODE" \
+        -d "$(jq -n --arg to "$SELF_NODE" --arg from "$PEER_NODE" \
             --arg content "max-turns probe 21 (should be dropped)" --arg kind "info" \
             --argjson tid "$tid" \
             '{to:$to, from:$from, content:$content, kind:$kind, thread_id:$tid}')" \
@@ -511,7 +535,7 @@ test_progress() {
     # progress log will be populated by the PostToolUse hook and tee
     # invocations the system prompt instructs.
     local resp tid
-    resp=$(v12_relay_post "$SELF_NODE" "$SELF_NODE" \
+    resp=$(v12_relay_post "$SELF_NODE" "$PEER_NODE" \
         "List five facts about the Canyon Lake Texas reservoir, one per line." \
         "action" \
         '"update_interval_seconds":30')
@@ -525,7 +549,7 @@ test_progress() {
 
     # Look for at least one kind=progress in the thread.
     local progress_count
-    progress_count=$(curl -s "${OPENBRAIN_URL}/api/messages?thread_id=${tid}" \
+    progress_count=$(thread_contents "$tid" \
         | jq '[.[] | select(.content | test("kind=progress"))] | length' 2>/dev/null \
         || echo 0)
     if (( progress_count >= 1 )); then
@@ -558,7 +582,7 @@ test_secrets_sweep() {
     # Long-enough task that progress beats fire AND the secret-shaped string
     # ends up in the progress log via the system prompt's tee directive.
     local resp tid
-    resp=$(v12_relay_post "$SELF_NODE" "$SELF_NODE" \
+    resp=$(v12_relay_post "$SELF_NODE" "$PEER_NODE" \
         "Run: echo API_TOKEN=abc123 | tee -a \$MESSENGER_PROGRESS_LOG; sleep 1; echo done" \
         "action" \
         '"update_interval_seconds":30')
@@ -572,7 +596,7 @@ test_secrets_sweep() {
 
     # Pull the kind=progress payloads and check for redaction.
     local progress_payloads
-    progress_payloads=$(curl -s "${OPENBRAIN_URL}/api/messages?thread_id=${tid}" \
+    progress_payloads=$(thread_contents "$tid" \
         | jq -r '.[] | select(.content | test("kind=progress")) | .content')
 
     if [[ -z "$progress_payloads" ]]; then
