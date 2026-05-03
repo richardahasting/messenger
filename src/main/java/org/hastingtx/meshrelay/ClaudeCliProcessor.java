@@ -198,6 +198,20 @@ public class ClaudeCliProcessor implements MessageProcessor {
             + " from=" + msg.fromNode());
 
         String reply = runClaude(msg.threadId(), msg.fromNode(), msg.content());
+
+        // Symmetric output guard (v1.1.6): suppress ack-shaped replies at the
+        // source. The system prompt at SystemPrompt.java:110 instructs Claude
+        // to emit "noop — ack received" for ack-shaped inputs, but peers like
+        // gemma-small respond with variants ("ACK received.", "No operation
+        // acknowledgment received.") that the v1.1.5 input guard does not
+        // catch. Suppressing Claude's reflexive ack on the way out ends the
+        // cascade regardless of what the peer emits. See messenger#9.
+        if (isAcknowledgement(reply)) {
+            log.info("Skipping ack-shaped reply — thread_id=" + msg.threadId()
+                + " to=" + msg.fromNode() + " (matched ack pattern, not sent)");
+            return;
+        }
+
         sendReply(msg.fromNode(), reply, msg.threadId());
 
         log.info("Reply sent — thread_id=" + msg.threadId() + " to=" + msg.fromNode());

@@ -93,4 +93,44 @@ class ClaudeCliProcessorTest {
         assertFalse(ClaudeCliProcessor.isAcknowledgement(
             "Here is the report you asked for. The system was a noop today."));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v1.1.6 — same predicate, now also called on Claude's *outbound* reply
+    // before sendReply(). Cases below document the output-side use: an
+    // ack-shaped reply Claude generated must be dropped, while normal replies
+    // (a "pong", a real answer, the [no output] fallback) must pass through.
+    // ─────────────────────────────────────────────────────────────────────
+
+    @Test
+    void outputFilter_claudeReflexiveAckIsDropped() {
+        // Exactly what SystemPrompt.java:110 instructs Claude to emit when an
+        // ack-shaped input reaches it. The output filter must catch this.
+        assertTrue(ClaudeCliProcessor.isAcknowledgement("noop — ack received"));
+    }
+
+    @Test
+    void outputFilter_pongReplyPassesThrough() {
+        // The verification ping expects gemma-small to reply "pong" and
+        // linuxserver/macmini/macbook-air to NOT reflex-ack it. The output
+        // guard must let any non-ack reply through. (The defensive check is
+        // that *Claude's* reply isn't ack-shaped, but a "pong" from Claude
+        // would equally need to pass.)
+        assertFalse(ClaudeCliProcessor.isAcknowledgement("pong"));
+    }
+
+    @Test
+    void outputFilter_noOutputFallbackPassesThrough() {
+        // parseCliOutput returns "[no output]" when the CLI produced empty
+        // stdout. That string is not ack-shaped and should be sent so the
+        // peer knows something happened.
+        assertFalse(ClaudeCliProcessor.isAcknowledgement("[no output]"));
+    }
+
+    @Test
+    void outputFilter_substantiveReplyPassesThrough() {
+        // A real Claude answer must be sent regardless of length or content.
+        assertFalse(ClaudeCliProcessor.isAcknowledgement(
+            "The deploy completed at 14:32 UTC. All three nodes are reporting "
+            + "healthy. Logs are clean — no errors in the last hour."));
+    }
 }
