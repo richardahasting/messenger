@@ -10,6 +10,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 /**
@@ -53,6 +58,14 @@ public class RelayHandler implements HttpHandler {
     private final HttpClient      client;
     private final PeerConfig      config;
     private final OpenBrainStore  brain;
+
+    /**
+     * Per-thread monotonic counters used to stamp default seq_id values
+     * when the sender omits seq_id. Key format: "<from_node>:<thread_id>".
+     * Daemon-local; lost on restart. Acceptable because the v1.2 dedup cache
+     * (issue #16) is also daemon-local.
+     */
+    private final ConcurrentMap<String, AtomicLong> seqCounters = new ConcurrentHashMap<>();
 
     public RelayHandler(HttpClient client, PeerConfig config, OpenBrainStore brain) {
         this.client = client;
@@ -98,7 +111,24 @@ public class RelayHandler implements HttpHandler {
         if (version == null || version.isBlank()) {
             version = Version.VERSION; // daemon stamps its own version when caller omits it
         }
-        content = stampVersionHeader(content, fromNode, version, kind);
+
+        // v1.2 wire-format fields. No behavior change in this issue (#12) —
+        // fields are parsed, defaulted, validated, and stamped onto the stored
+        // content. Subsequent issues consume them (dispatch #13, NO_REPLY #15,
+        // dedup #16, progress #17).
+        String effectiveKind = (kind != null && !kind.isBlank()) ? kind : "action";
+        if (V12Fields.requiresInReplyTo(effectiveKind)
+                && (json.getString("in_reply_to") == null
+                    || json.getString("in_reply_to").isBlank())) {
+            sendError(exchange, 400, "Missing required field 'in_reply_to' for kind=" + effectiveKind);
+            return;
+        }
+        V12Fields v12 = V12Fields.parseFromJson(json, effectiveKind);
+        if (v12.seqId() == null || v12.seqId().isBlank()) {
+            v12 = v12.withSeqId(stampDefaultSeqId(fromNode, threadId));
+        }
+
+        content = stampVersionHeader(content, fromNode, version, kind, v12);
 
         String targetUrl = config.urlFor(toNode);
         if (targetUrl == null) {
@@ -137,33 +167,84 @@ public class RelayHandler implements HttpHandler {
 
     /**
      * Prepend a machine-parseable version header to outgoing message content.
-     * Format: [messenger v&lt;ver&gt; from &lt;node&gt;(  kind=&lt;kind&gt;)?]\n\n&lt;body&gt;
+     * Format: [messenger v&lt;ver&gt; from &lt;node&gt;( &lt;k=v&gt;)*]\n\n&lt;body&gt;
      *
      * Kind values recognized by the receiving poller:
      *   action (default, omitted from header) — triggers processor (Claude CLI)
-     *   ack    — archived without processor invocation
-     *   info   — archived without processor invocation
+     *   ack, info, reply, progress, ping — non-actionable, archived without processor
      *
-     * Receivers can regex-extract: ^\[messenger v(\S+) from (\S+?)(?:\s+kind=(\S+))?\]
+     * v1.2 fields (seq, ack, reply, in_reply_to, respond_by, update) are appended
+     * as additional `key=value` tokens inside the brackets.
      */
     static String stampVersionHeader(String content, String fromNode, String version) {
-        return stampVersionHeader(content, fromNode, version, null);
+        return stampVersionHeader(content, fromNode, version, null, null);
     }
 
     static String stampVersionHeader(String content, String fromNode, String version, String kind) {
+        return stampVersionHeader(content, fromNode, version, kind, null);
+    }
+
+    static String stampVersionHeader(String content, String fromNode, String version,
+                                     String kind, V12Fields v12) {
         if (version == null || version.isBlank())  version  = Version.VERSION;
         if (fromNode == null || fromNode.isBlank()) fromNode = "unknown";
         if (content == null) content = "";
-        String kindSuffix = (kind != null && !kind.isBlank() && !"action".equals(kind))
-            ? " kind=" + kind : "";
-        return "[messenger v" + version + " from " + fromNode + kindSuffix + "]\n\n" + content;
+        StringBuilder fields = new StringBuilder();
+        if (kind != null && !kind.isBlank() && !"action".equals(kind)) {
+            fields.append(" kind=").append(kind);
+        }
+        if (v12 != null) {
+            if (v12.seqId() != null && !v12.seqId().isBlank()) {
+                fields.append(" seq=").append(v12.seqId());
+            }
+            if (v12.ackPolicy() != null && !v12.ackPolicy().isBlank()) {
+                fields.append(" ack=").append(v12.ackPolicy());
+            }
+            if (v12.replyPolicy() != null && !v12.replyPolicy().isBlank()) {
+                fields.append(" reply=").append(v12.replyPolicy());
+            }
+            if (v12.inReplyTo() != null && !v12.inReplyTo().isBlank()) {
+                fields.append(" in_reply_to=").append(v12.inReplyTo());
+            }
+            if (v12.respondBy() != null && !v12.respondBy().isBlank()) {
+                fields.append(" respond_by=").append(v12.respondBy());
+            }
+            if (v12.updateIntervalSeconds() != null) {
+                fields.append(" update=").append(v12.updateIntervalSeconds());
+            }
+        }
+        return "[messenger v" + version + " from " + fromNode + fields + "]\n\n" + content;
     }
 
-    // Matches the version header so poller + other readers can extract kind.
-    // Intentionally lenient: kind is optional, absence ⇒ "action".
+    /**
+     * Matches the version header. Group 3 captures the trailing whitespace-separated
+     * `key=value` tokens (kind, seq, ack, reply, in_reply_to, respond_by, update).
+     *
+     * Backwards-compatible: pre-v1.2 headers (no trailing fields, or only kind=...)
+     * still match — group 3 is empty or contains just " kind=...". Use
+     * {@link #parseHeaderFields} to split the trailer into a Map for lookup.
+     */
     static final java.util.regex.Pattern HEADER_PATTERN = java.util.regex.Pattern.compile(
-        "^\\[messenger v(\\S+) from (\\S+?)(?:\\s+kind=(\\S+))?\\]"
+        "^\\[messenger v(\\S+) from (\\S+?)((?:\\s+\\w+=\\S+)*)\\]"
     );
+
+    /**
+     * Split the trailing header fields (group 3 of HEADER_PATTERN) into a
+     * key→value map. Order-independent, so future additions don't reshuffle
+     * group indices.
+     */
+    static Map<String, String> parseHeaderFields(String trailer) {
+        if (trailer == null || trailer.isBlank()) return Map.of();
+        Map<String, String> result = new LinkedHashMap<>();
+        for (String token : trailer.trim().split("\\s+")) {
+            if (token.isEmpty()) continue;
+            int eq = token.indexOf('=');
+            if (eq > 0 && eq < token.length() - 1) {
+                result.put(token.substring(0, eq), token.substring(eq + 1));
+            }
+        }
+        return result;
+    }
 
     /**
      * Extract the kind from a stored content header. Returns "action" for messages
@@ -171,11 +252,30 @@ public class RelayHandler implements HttpHandler {
      * kind suffix). Returns the parsed value otherwise.
      */
     public static String extractKind(String content) {
-        if (content == null) return "action";
+        return extractHeaderField(content, "kind", "action");
+    }
+
+    /**
+     * Extract a named header field from stored content, with a default value if
+     * absent. Used by extractKind and (in subsequent v1.2 issues) by extractors
+     * for seq, in_reply_to, etc.
+     */
+    public static String extractHeaderField(String content, String fieldName, String defaultValue) {
+        if (content == null) return defaultValue;
         var m = HEADER_PATTERN.matcher(content);
-        if (!m.find()) return "action";
-        String kind = m.group(3);
-        return (kind == null || kind.isBlank()) ? "action" : kind;
+        if (!m.find()) return defaultValue;
+        String value = parseHeaderFields(m.group(3)).get(fieldName);
+        return (value == null || value.isBlank()) ? defaultValue : value;
+    }
+
+    /**
+     * Generate a daemon-stamped seq_id when the sender omits one.
+     * Format: <from>:<thread_id>:<counter>, with counter monotonic per (from, thread).
+     */
+    String stampDefaultSeqId(String fromNode, long threadId) {
+        String key = fromNode + ":" + threadId;
+        long n = seqCounters.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
+        return fromNode + ":" + threadId + ":" + n;
     }
 
     /**
@@ -259,5 +359,93 @@ public class RelayHandler implements HttpHandler {
         exchange.sendResponseHeaders(code, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // v1.2 wire-format fields
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * v1.2 fields from the inbound /relay JSON body. All fields are optional on
+     * the wire; defaults for ack_policy and reply_policy are applied here based
+     * on the message kind (per docs/protocol-v1.2.md "Wire format" table).
+     *
+     * No behavior change in this issue — fields are read into the in-flight
+     * message, defaulted, validated, and stamped onto the stored content header.
+     * Subsequent issues consume them: dispatch (#13), NO_REPLY (#15), dedup (#16),
+     * progress (#17).
+     */
+    public record V12Fields(
+            String  seqId,
+            String  ackPolicy,
+            String  replyPolicy,
+            String  respondBy,
+            Integer updateIntervalSeconds,
+            String  inReplyTo
+    ) {
+        /**
+         * Parse v1.2 fields from a /relay JSON body and apply per-kind defaults
+         * for ack_policy and reply_policy. seq_id is left null when absent —
+         * the caller stamps it from a per-thread counter so the value is correct
+         * relative to daemon state.
+         */
+        public static V12Fields parseFromJson(Json json, String effectiveKind) {
+            String seqId       = json.getString("seq_id");
+            String ackPolicy   = json.getString("ack_policy");
+            String replyPolicy = json.getString("reply_policy");
+            String respondBy   = json.getString("respond_by");
+            String inReplyTo   = json.getString("in_reply_to");
+
+            // update_interval_seconds is optional — the daemon clamps to [30, 120]
+            // when consuming it (issue #17). Here we just record the raw int.
+            Integer updateInterval = json.has("update_interval_seconds")
+                ? json.getInt("update_interval_seconds", 0)
+                : null;
+
+            if (ackPolicy == null || ackPolicy.isBlank())     ackPolicy   = defaultAckPolicy(effectiveKind);
+            if (replyPolicy == null || replyPolicy.isBlank()) replyPolicy = defaultReplyPolicy(effectiveKind);
+
+            return new V12Fields(seqId, ackPolicy, replyPolicy, respondBy, updateInterval, inReplyTo);
+        }
+
+        /** Replace seq_id (used to stamp the daemon-generated default). */
+        public V12Fields withSeqId(String newSeqId) {
+            return new V12Fields(newSeqId, ackPolicy, replyPolicy, respondBy,
+                                  updateIntervalSeconds, inReplyTo);
+        }
+
+        /**
+         * Default ack_policy per spec table:
+         *   action, ping             → REQ_ACK
+         *   info, reply, ack, progress → NO_ACK
+         */
+        public static String defaultAckPolicy(String kind) {
+            return switch (kind) {
+                case "action", "ping"                       -> "REQ_ACK";
+                case "info", "reply", "ack", "progress"     -> "NO_ACK";
+                default                                     -> "REQ_ACK"; // unknown ⇒ treat like action
+            };
+        }
+
+        /**
+         * Default reply_policy per spec table:
+         *   action, ping                        → REPLY
+         *   info, reply, ack, progress          → NO_REPLY
+         */
+        public static String defaultReplyPolicy(String kind) {
+            return switch (kind) {
+                case "action", "ping"                       -> "REPLY";
+                case "info", "reply", "ack", "progress"     -> "NO_REPLY";
+                default                                     -> "REPLY";
+            };
+        }
+
+        /**
+         * True for kinds that require in_reply_to per the spec:
+         * reply, ack, and progress all reference a prior message's seq_id.
+         */
+        public static boolean requiresInReplyTo(String kind) {
+            return "reply".equals(kind) || "ack".equals(kind) || "progress".equals(kind);
+        }
     }
 }
