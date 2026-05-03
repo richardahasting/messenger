@@ -434,9 +434,273 @@ class MessagePollerTest {
 
     @Test
     void maxTurnsPerThreadConstantIsTwenty() {
-        // Stub for v1.2.0 (2/9). Enforcement lands in issue #14;
-        // this assertion guards against silent retuning of the ceiling.
+        // Issue #15 wires enforcement; this assertion guards against silent
+        // retuning of the ceiling.
         assertEquals(20, MessagePoller.MAX_TURNS_PER_THREAD);
+    }
+
+    // ── v1.2 NO_REPLY / NO_ACK suppression (issue #15) ──────────────────
+
+    /** Build an action message with explicit reply_policy / ack_policy. */
+    private static String stampWithPolicies(String content, String fromNode,
+                                            String replyPolicy, String ackPolicy) {
+        RelayHandler.V12Fields v12 = new RelayHandler.V12Fields(
+            /*seqId=*/         fromNode + ":42:1",
+            /*ackPolicy=*/     ackPolicy,
+            /*replyPolicy=*/   replyPolicy,
+            /*respondBy=*/     null,
+            /*updateInterval=*/null,
+            /*inReplyTo=*/     null);
+        return RelayHandler.stampVersionHeader(content, fromNode, "1.2.0", "action", v12);
+    }
+
+    /** Build an action message with default action policies (REPLY/REQ_ACK). */
+    private static String stampAction(String content, String fromNode, String seq) {
+        return RelayHandler.stampVersionHeader(content, fromNode, "1.2.0", "action",
+            new RelayHandler.V12Fields(seq, "REQ_ACK", "REPLY", null, null, null));
+    }
+
+    /** Build a reply (or other terminal kind) with the spec defaults — NO_ACK / NO_REPLY. */
+    private static String stampWithKindAndSeq(String content, String fromNode,
+                                              String kind, String seq, String inReplyTo) {
+        RelayHandler.V12Fields v12 = new RelayHandler.V12Fields(
+            seq, "NO_ACK", "NO_REPLY", null, null, inReplyTo);
+        return RelayHandler.stampVersionHeader(content, fromNode, "1.2.0", kind, v12);
+    }
+
+    @Test
+    void isAutoResponseSuppressedReadsHeaderFields() {
+        // Default (action defaults: REPLY/REQ_ACK) — not suppressed.
+        String defaultAction = RelayHandler.stampVersionHeader(
+            "do the thing", "macmini", "1.2.0", "action");
+        assertFalse(MessagePoller.isAutoResponseSuppressed(defaultAction),
+            "default action policies must allow auto-response");
+
+        // reply_policy=NO_REPLY → suppressed
+        String noReply = stampWithPolicies("do the thing", "macmini", "NO_REPLY", "REQ_ACK");
+        assertTrue(MessagePoller.isAutoResponseSuppressed(noReply));
+
+        // ack_policy=NO_ACK → suppressed
+        String noAck = stampWithPolicies("do the thing", "macmini", "REPLY", "NO_ACK");
+        assertTrue(MessagePoller.isAutoResponseSuppressed(noAck));
+
+        // Pre-v1.2 message (no v1.2 fields at all) — defaults apply, not suppressed.
+        assertFalse(MessagePoller.isAutoResponseSuppressed(
+            "[messenger v1.1.4 from macmini]\n\nbody"),
+            "pre-v1.2 headers must default to action policies (not suppressed)");
+        // Headerless legacy content — also not suppressed.
+        assertFalse(MessagePoller.isAutoResponseSuppressed("just plain content"));
+    }
+
+    @Test
+    @Timeout(10)
+    void noReplyPolicySuppressesProcessorAndArchives() {
+        // Acceptance: receiver does NOT auto-respond when inbound has
+        // reply_policy=NO_REPLY. Implementation: skip processor entirely so
+        // we don't even spawn the Claude session — running it just to discard
+        // the reply wastes a session and risks side effects.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String content = stampWithPolicies(
+            "kindly fire and forget", "macmini", "NO_REPLY", "REQ_ACK");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            1000, 1000L, "macmini", "linuxserver", content, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get(),
+            "NO_REPLY inbound must not invoke the processor");
+        assertEquals(List.of(1000), brain.archived,
+            "NO_REPLY inbound must be archived so it doesn't reappear");
+        assertTrue(brain.delivered.isEmpty(),
+            "no need to mark delivered when we're not processing");
+    }
+
+    @Test
+    @Timeout(10)
+    void noAckPolicyAlsoSuppressesProcessor() {
+        // ack_policy=NO_ACK is the alternate spelling of "don't auto-respond".
+        // Suppression must fire on EITHER field (issue #15: "Suppress
+        // auto-response when ack_policy=NO_ACK OR reply_policy=NO_REPLY").
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String content = stampWithPolicies(
+            "noisy notification", "macmini", "REPLY", "NO_ACK");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            1001, 1001L, "macmini", "linuxserver", content, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(0, proc.processCount.get());
+        assertEquals(List.of(1001), brain.archived);
+    }
+
+    @Test
+    @Timeout(10)
+    void multiTurnHappyPath() {
+        // Acceptance: A→B(action,REQ_ACK), B→A(reply,NO_REPLY),
+        //             A→B(action,REQ_ACK), B→A(reply,NO_REPLY) —
+        // 4 messages in one thread, no auto-loop.
+        //
+        // From B's perspective (this poller) the inbox sees both the actions
+        // it's about to process AND any replies that round-trip through the
+        // mesh. Replies must bypass the processor; actions must process. Two
+        // processor calls total — never more, never less.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+
+        // seq=1 — A asks (action with default REPLY/REQ_ACK policies)
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            2001, 42L, "macmini", "linuxserver",
+            stampAction("what's the lake level?", "macmini", "macmini:42:1"),
+            "pending"));
+        // seq=2 — B's reply (loopback for thread state); kind=reply must skip
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            2002, 42L, "linuxserver", "macmini",
+            stampWithKindAndSeq("907 ft, 99.8% full",
+                "linuxserver", "reply", "linuxserver:42:2", "macmini:42:1"),
+            "pending"));
+        // seq=3 — A's follow-up on the same thread (thread stays open)
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            2003, 42L, "macmini", "linuxserver",
+            stampAction("has it changed in 24h?", "macmini", "macmini:42:3"),
+            "pending"));
+        // seq=4 — B's reply
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            2004, 42L, "linuxserver", "macmini",
+            stampWithKindAndSeq("up 0.3 ft",
+                "linuxserver", "reply", "linuxserver:42:4", "macmini:42:3"),
+            "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(2, proc.processCount.get(),
+            "exactly the 2 actions must reach the processor — no auto-loop, "
+            + "no extra invocations from the reply messages");
+        // Actions claimed via markDelivered; replies skipped pre-dispatch.
+        assertEquals(List.of(2001, 2003), brain.delivered);
+        // All 4 archived (order = arrival order; both actions and replies
+        // archive before continue to next message).
+        assertTrue(brain.archived.containsAll(List.of(2001, 2002, 2003, 2004)),
+            "all 4 thread messages must be archived after the poll cycle");
+        assertEquals(4, brain.archived.size(),
+            "exactly 4 archives — no extra outbound side effect");
+    }
+
+    // ── v1.2 MAX_TURNS_PER_THREAD ceiling (issue #15) ───────────────────
+
+    @Test
+    @Timeout(30)
+    void maxTurnsPerThreadDropsTwentyFirstMessage() {
+        // Acceptance: thread with 21 non-progress messages drops the 21st
+        // with a warning; 22nd, 23rd... also dropped.
+        //
+        // 21 kind=action messages on the same thread. First 20 process; 21st
+        // is dropped + archived without processor invocation.
+        //
+        // Senders rotate per message — the per-sender rate limiter (3 msgs /
+        // 10 min) is orthogonal to the per-thread cap and would otherwise
+        // mask the cap behaviour. Using a unique sender per message
+        // bypasses the rate limiter so the test isolates MAX_TURNS_PER_THREAD.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+
+        for (int i = 1; i <= 21; i++) {
+            String sender = "peer" + i;
+            String content = stampAction("task #" + i, sender, sender + ":99:" + i);
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                3000 + i, 99L, sender, "linuxserver", content, "pending"));
+        }
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(MessagePoller.MAX_TURNS_PER_THREAD, proc.processCount.get(),
+            "exactly MAX_TURNS_PER_THREAD (=20) actions must process; the 21st is dropped");
+        // 21st (id=3021) must be archived but NOT delivered
+        assertTrue(brain.archived.contains(3021),
+            "21st message must be archived");
+        assertFalse(brain.delivered.contains(3021),
+            "21st message must NOT have been claimed (markDelivered) — it was dropped pre-dispatch");
+    }
+
+    @Test
+    @Timeout(30)
+    void maxTurnsPerThreadAlsoDropsTwentySecondAndBeyond() {
+        // Once a thread is at the wall, subsequent inbound on it stays at the wall.
+        // No reset mechanism in v1.2.0.
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+
+        for (int i = 1; i <= 25; i++) {
+            String sender = "peer" + i;
+            String content = stampAction("task #" + i, sender, sender + ":77:" + i);
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                4000 + i, 77L, sender, "linuxserver", content, "pending"));
+        }
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        // First 20 process; messages 21..25 (5 of them) are dropped.
+        assertEquals(20, proc.processCount.get());
+        for (int i = 21; i <= 25; i++) {
+            assertTrue(brain.archived.contains(4000 + i),
+                "message " + (4000 + i) + " (turn " + i + ") must be archived");
+            assertFalse(brain.delivered.contains(4000 + i),
+                "message " + (4000 + i) + " must not have been claimed");
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void maxTurnsPerThreadExcludesProgressMessages() {
+        // Acceptance: kind=progress messages do NOT count toward the 20-message cap.
+        // Load thread with 19 non-progress + 100 progress; the 20th non-progress
+        // must still process (count after it = 20, which is == MAX, NOT > MAX).
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+
+        // 19 actions interleaved with 100 progress messages — same thread.
+        // Lay them down in arrival order: 19 actions first, then 100 progress
+        // beats, then the 20th action.
+        int messageId = 5000;
+        for (int i = 1; i <= 19; i++) {
+            String sender = "peer" + i;
+            String content = stampAction("task #" + i, sender, sender + ":55:" + i);
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                ++messageId, 55L, sender, "linuxserver", content, "pending"));
+        }
+        for (int i = 1; i <= 100; i++) {
+            String content = stampWithKindAndSeq(
+                "(no log activity)", "watcher", "progress",
+                "watcher:55:p" + i, "peer1:55:1");
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                ++messageId, 55L, "watcher", "linuxserver", content, "pending"));
+        }
+        // The 20th action — must still process because progress doesn't count.
+        String twentiethContent = stampAction(
+            "20th action — should still flow through", "peer20", "peer20:55:20");
+        int twentiethId = ++messageId;
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            twentiethId, 55L, "peer20", "linuxserver", twentiethContent, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertEquals(20, proc.processCount.get(),
+            "20 actions must process — progress beats don't count toward the cap");
+        assertTrue(brain.delivered.contains(twentiethId),
+            "20th non-progress message must have been claimed and processed");
     }
 
     @Test

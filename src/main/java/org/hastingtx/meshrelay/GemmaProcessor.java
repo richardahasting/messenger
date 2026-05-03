@@ -89,9 +89,18 @@ public class GemmaProcessor implements MessageProcessor {
             + " from=" + msg.fromNode());
 
         String reply = callGemma(msg.fromNode(), msg.threadId(), msg.content());
-        sendReply(msg.fromNode(), reply, msg.threadId());
 
-        log.info("Reply sent to " + msg.fromNode() + " thread_id=" + msg.threadId());
+        // v1.2 auto-response shape (issue #15): kind=reply, NO_REPLY,
+        // in_reply_to=<inbound seq_id>. Mirrors ClaudeCliProcessor.
+        String inReplyTo = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+        if (inReplyTo == null || inReplyTo.isBlank()) {
+            inReplyTo = msg.fromNode() + ":" + msg.threadId() + ":0";
+        }
+
+        sendReply(msg.fromNode(), reply, msg.threadId(), inReplyTo);
+
+        log.info("Reply sent to " + msg.fromNode() + " thread_id=" + msg.threadId()
+            + " in_reply_to=" + inReplyTo);
     }
 
     private String callGemma(String fromNode, long threadId, String userContent) throws Exception {
@@ -122,10 +131,13 @@ public class GemmaProcessor implements MessageProcessor {
         return extractReplyText(response.body());
     }
 
-    private void sendReply(String toNode, String replyContent, long threadId) throws Exception {
+    private void sendReply(String toNode, String replyContent, long threadId, String inReplyTo) throws Exception {
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
             + "\"content\":\"" + Json.escape(replyContent) + "\","
+            + "\"kind\":\"reply\","
+            + "\"reply_policy\":\"NO_REPLY\","
+            + "\"in_reply_to\":\"" + Json.escape(inReplyTo) + "\","
             + "\"thread_id\":" + threadId + "}";
 
         HttpRequest request = HttpRequest.newBuilder()

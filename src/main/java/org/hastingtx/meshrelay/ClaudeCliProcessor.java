@@ -212,9 +212,23 @@ public class ClaudeCliProcessor implements MessageProcessor {
             return;
         }
 
-        sendReply(msg.fromNode(), reply, msg.threadId());
+        // Auto-response stamping (issue #15). Per docs/protocol-v1.2.md
+        // § "Receiver behavior" step 4: the reply MUST carry kind=reply,
+        // reply_policy=NO_REPLY, and in_reply_to=<inbound seq_id>. NO_REPLY
+        // is what closes the loop — without it, a peer could auto-respond
+        // to our reply and we'd echo back forever.
+        String inReplyTo = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+        if (inReplyTo == null || inReplyTo.isBlank()) {
+            // Pre-v1.2 sender, or stripped header — synthesise so the reply's
+            // mandatory in_reply_to is non-empty (RelayHandler 400-guards on
+            // missing in_reply_to for kind=reply).
+            inReplyTo = msg.fromNode() + ":" + msg.threadId() + ":0";
+        }
 
-        log.info("Reply sent — thread_id=" + msg.threadId() + " to=" + msg.fromNode());
+        sendReply(msg.fromNode(), reply, msg.threadId(), inReplyTo);
+
+        log.info("Reply sent — thread_id=" + msg.threadId() + " to=" + msg.fromNode()
+            + " in_reply_to=" + inReplyTo);
     }
 
     // Matches bare acknowledgement payloads like "noop", "ack received",
@@ -336,10 +350,18 @@ public class ClaudeCliProcessor implements MessageProcessor {
         return stdout.length() > 2000 ? stdout.substring(0, 2000) + "…" : stdout;
     }
 
-    private void sendReply(String toNode, String content, long threadId) throws Exception {
+    private void sendReply(String toNode, String content, long threadId, String inReplyTo) throws Exception {
+        // v1.2 auto-response shape: kind=reply, reply_policy=NO_REPLY,
+        // in_reply_to=<inbound seq>. RelayHandler defaults reply_policy to
+        // NO_REPLY for kind=reply already, but stamping it explicitly guards
+        // against future default changes drifting from the spec invariant
+        // ("an auto-response always carries reply_policy=NO_REPLY").
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
             + "\"content\":\"" + Json.escape(content) + "\","
+            + "\"kind\":\"reply\","
+            + "\"reply_policy\":\"NO_REPLY\","
+            + "\"in_reply_to\":\"" + Json.escape(inReplyTo) + "\","
             + "\"thread_id\":" + threadId + "}";
 
         HttpRequest req = HttpRequest.newBuilder()

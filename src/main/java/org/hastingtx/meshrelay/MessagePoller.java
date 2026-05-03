@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
@@ -47,7 +48,13 @@ public class MessagePoller implements Runnable {
      * is excluded from the count — a 1-hour task at 30s beats produces ~120
      * progress messages, which would otherwise trip the ceiling.
      *
-     * Stub for v1.2.0 (2/9). Enforcement is added in issue #14.
+     * Enforcement (issue #15): each non-progress inbound increments the
+     * per-thread counter; once the counter exceeds this value, subsequent
+     * inbound on that thread is archived without dispatch and a warning is
+     * logged. The counter is daemon-local — it resets on restart, the same
+     * way the dedup cache (#16) does. Once a thread hits the wall, there is
+     * no in-protocol mechanism to reset it; an operator must start a new
+     * thread.
      */
     static final int MAX_TURNS_PER_THREAD = 20;
 
@@ -81,6 +88,14 @@ public class MessagePoller implements Runnable {
      * unbounded map growth.
      */
     private final ConcurrentHashMap<Long, ReentrantLock> threadLocks = new ConcurrentHashMap<>();
+
+    /**
+     * Per-thread non-progress message counter for the {@link #MAX_TURNS_PER_THREAD}
+     * backstop. Daemon-local — resets on restart, same as the dedup cache (#16).
+     * Counters are NOT removed once a thread is capped: keeping them in the map
+     * is what makes the cap sticky for the lifetime of the daemon.
+     */
+    private final ConcurrentHashMap<Long, AtomicInteger> threadCounters = new ConcurrentHashMap<>();
 
     // ── Per-sender rate limiting ──────────────────────────────────────────
     // Prevents chatty agents (e.g. Gemma hallucinating tasks) from flooding
@@ -215,6 +230,31 @@ public class MessagePoller implements Runnable {
                 continue;
             }
             String kind = RelayHandler.extractKind(msg.content());
+
+            // MAX_TURNS_PER_THREAD backstop (issue #15). Every non-progress
+            // inbound increments the per-thread counter; once the count
+            // exceeds the ceiling, drop the message with a warning. progress
+            // beats are excluded — a 1-hour task at 30s beats produces ~120
+            // progress messages, which would otherwise trip the ceiling.
+            // See docs/protocol-v1.2.md § "Backstop: max-turns ceiling".
+            if (!"progress".equals(kind)) {
+                int count = incrementThreadCount(msg.threadId());
+                if (count > MAX_TURNS_PER_THREAD) {
+                    log.warning("Thread cap (>" + MAX_TURNS_PER_THREAD + ") exceeded —"
+                        + " dropping message_id=" + msg.messageId()
+                        + " thread_id=" + msg.threadId()
+                        + " kind=" + kind
+                        + " from=" + msg.fromNode()
+                        + " count=" + count
+                        + " — archive without dispatch (operator must start a new thread)");
+                    brain.markArchived(msg.messageId());
+                    if ("all".equals(msg.toNode())) {
+                        brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                    }
+                    continue;
+                }
+            }
+
             if (!"action".equals(kind)) {
                 // Non-action kinds don't run the processor — they're either
                 // protocol signals (ack, reply, progress, ping) or one-way
@@ -244,6 +284,29 @@ public class MessagePoller implements Runnable {
                 }
                 continue;
             }
+
+            // NO_REPLY / NO_ACK suppression (issue #15). When the sender marks
+            // an action with reply_policy=NO_REPLY or ack_policy=NO_ACK, the
+            // receiver MUST NOT auto-respond. We skip processor invocation
+            // entirely — running Claude only to discard the reply wastes a
+            // session and risks side-effects the sender did not consent to.
+            // This replaces the v1.1.6 ack-shaped output filter with a
+            // structural check on the protocol field; the v1.1.6 filter stays
+            // active in ClaudeCliProcessor as defense-in-depth (per spec
+            // "Migration plan").
+            if (isAutoResponseSuppressed(msg.content())) {
+                log.info("Auto-response suppressed by inbound policy —"
+                    + " thread_id=" + msg.threadId()
+                    + " message_id=" + msg.messageId()
+                    + " from=" + msg.fromNode()
+                    + " (reply_policy=NO_REPLY or ack_policy=NO_ACK)");
+                brain.markArchived(msg.messageId());
+                if ("all".equals(msg.toNode())) {
+                    brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+                }
+                continue;
+            }
+
             if (isRateLimited(msg.fromNode())) {
                 log.warning("Rate limited sender=" + msg.fromNode()
                     + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
@@ -253,6 +316,34 @@ public class MessagePoller implements Runnable {
             }
             processWithThreadLock(msg);
         }
+    }
+
+    /**
+     * Increment and return the per-thread non-progress message count. Called
+     * for every inbound that is NOT {@code kind=progress}. Used by the
+     * MAX_TURNS_PER_THREAD backstop. Package-private for testing.
+     */
+    int incrementThreadCount(long threadId) {
+        return threadCounters.computeIfAbsent(threadId, id -> new AtomicInteger(0))
+                             .incrementAndGet();
+    }
+
+    /**
+     * True when the inbound message's policy fields tell the receiver not to
+     * auto-respond: {@code reply_policy=NO_REPLY} OR {@code ack_policy=NO_ACK}.
+     *
+     * <p>Defaults follow the spec table: {@code action} defaults to
+     * {@code REPLY}/{@code REQ_ACK}, so the suppression only fires when the
+     * sender explicitly set one of the no-response variants. Pre-v1.2 senders
+     * (no policy fields in header) fall through with the action defaults and
+     * are processed normally.
+     *
+     * <p>Package-private for testing.
+     */
+    static boolean isAutoResponseSuppressed(String content) {
+        String replyPolicy = RelayHandler.extractHeaderField(content, "reply", "REPLY");
+        String ackPolicy   = RelayHandler.extractHeaderField(content, "ack",   "REQ_ACK");
+        return "NO_REPLY".equals(replyPolicy) || "NO_ACK".equals(ackPolicy);
     }
 
     /**
