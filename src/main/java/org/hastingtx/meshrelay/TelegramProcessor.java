@@ -174,19 +174,24 @@ public class TelegramProcessor implements MessageProcessor {
     }
 
     private void sendReply(String toNode, String replyContent, long threadId, String inReplyTo) throws Exception {
-        // kind="action" instead of "reply" (issue #23): the asking agent's
-        // session has already exited by the time Richard answers. If we sent
-        // kind=reply, the receiving poller would skip it (replies are
-        // data-only, by design) and the original task would never resume.
-        // kind=action makes the messenger invoke the processor, giving the
-        // agent a chance to read the thread for context and act on the answer.
-        // reply_policy=NO_REPLY prevents a reply storm — the receiving
-        // messenger will suppress any outbound reply (issue #15 enforcement).
+        // kind="action" (issue #23): the asking agent's session has already
+        // exited by the time Richard answers. kind=reply would be filtered by
+        // MessagePoller's non-action skip; kind=action invokes the processor
+        // so the agent can read the thread for context and act on the answer.
+        //
+        // reply_policy is intentionally omitted (defaults to REPLY). Setting
+        // NO_REPLY would trigger MessagePoller.isAutoResponseSuppressed and
+        // skip the processor entirely — defeating the whole point of issue
+        // #23. The risk of an outbound reply storm is bounded because:
+        //   1. The system prompt teaches Claude not to ack richard's answers.
+        //   2. ClaudeCliProcessor has a v1.1.6 ack-shaped output filter that
+        //      drops trivial acks before they're relayed.
+        //   3. If a substantive reply does come through, it's actually
+        //      meaningful and worth surfacing on Telegram.
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
             + "\"content\":\"" + Json.escape(replyContent) + "\","
             + "\"kind\":\"action\","
-            + "\"reply_policy\":\"NO_REPLY\","
             + "\"in_reply_to\":\"" + Json.escape(inReplyTo) + "\","
             + "\"thread_id\":" + threadId + "}";
 
