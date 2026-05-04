@@ -113,9 +113,10 @@ public class MeshRelay {
             relaySender, config.nodeName);
 
         // Processor selection — config.processor overrides auto-detection:
-        //   "gemma"     → GemmaProcessor only (dedicated Ollama agent)
-        //   "claude-cli"→ ClaudeCliProcessor only
-        //   null/absent → auto priority: ClaudeCliProcessor → GemmaProcessor → logging
+        //   "gemma"          → GemmaProcessor only (dedicated Ollama agent)
+        //   "claude-cli"     → ClaudeCliProcessor only
+        //   "telegram-relay" → TelegramProcessor (forwards to Richard via Telegram)
+        //   null/absent      → auto priority: ClaudeCliProcessor → GemmaProcessor → logging
         MessageProcessor processor;
         if ("gemma".equals(config.processor)) {
             log.info("Processor forced to Gemma via config");
@@ -129,6 +130,13 @@ public class MeshRelay {
             processor = ClaudeCliProcessor.create(client, config, brain, dedupCache, progressBeatScheduler);
             if (processor == null) {
                 log.severe("processor=claude-cli requested but claude binary not found — exiting.");
+                System.exit(1);
+            }
+        } else if ("telegram-relay".equals(config.processor)) {
+            log.info("Processor forced to TelegramProcessor via config");
+            processor = TelegramProcessor.create(client, config, dedupCache);
+            if (processor == null) {
+                log.severe("processor=telegram-relay requested but Telegram bot ask-user server is unreachable — exiting.");
                 System.exit(1);
             }
         } else {
