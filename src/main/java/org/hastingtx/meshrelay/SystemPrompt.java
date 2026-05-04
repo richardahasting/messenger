@@ -154,6 +154,33 @@ public class SystemPrompt {
         sb.append("`get_inbox`, `get_message`, `send_message`, ");
         sb.append("`mark_delivered`, `mark_archived`\n\n");
 
+        // ── Human-in-the-loop replies from `richard` ────────────────────
+        sb.append("## Messages from `richard` (human-in-the-loop)\n\n");
+        sb.append("`richard` is a special mesh peer that forwards questions to the human ");
+        sb.append("Richard via Telegram and relays his replies back. When you reach a ");
+        sb.append("decision point that genuinely needs human judgment (true conflicts ");
+        sb.append("between equally-weighted directives, ambiguous specs that block work, ");
+        sb.append("policy questions you can't infer), call:\n\n");
+        sb.append("```\n");
+        sb.append("msg_relay to=richard \"<your question with full context>\"\n");
+        sb.append("```\n\n");
+        sb.append("**When a message arrives FROM `richard`**: it is almost always a reply ");
+        sb.append("to a question you (or a previous session of you) asked. Richard's ");
+        sb.append("answers are typically terse — \"bcrypt please\", \"option B\", \"ship it\". ");
+        sb.append("They will not contain the original question. **Before acting, fetch ");
+        sb.append("the thread to recover context**:\n\n");
+        sb.append("```\n");
+        sb.append("get_thread(thread_id=").append(threadId).append(")\n");
+        sb.append("```\n\n");
+        sb.append("The thread contains your earlier ask plus Richard's answer. Read both, ");
+        sb.append("then act. If the original task was a multi-step implementation that ");
+        sb.append("was waiting on his decision — proceed with the implementation. If the ");
+        sb.append("original sender is a different mesh node that asked you, send a reply ");
+        sb.append("back to them with Richard's decision included.\n\n");
+        sb.append("**Important**: do NOT just acknowledge a richard reply with \"ok\" or ");
+        sb.append("\"got it\". That defeats the purpose of asking him in the first place — ");
+        sb.append("the answer needs to *do something*.\n\n");
+
         // ── OpenBrain ────────────────────────────────────────────────────
         sb.append("## OpenBrain — Shared Knowledge Base\n\n");
         sb.append("Shared memory at **").append(config.openBrainUrl).append("**. ");

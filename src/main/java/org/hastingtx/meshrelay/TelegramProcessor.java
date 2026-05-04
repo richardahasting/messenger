@@ -174,10 +174,18 @@ public class TelegramProcessor implements MessageProcessor {
     }
 
     private void sendReply(String toNode, String replyContent, long threadId, String inReplyTo) throws Exception {
+        // kind="action" instead of "reply" (issue #23): the asking agent's
+        // session has already exited by the time Richard answers. If we sent
+        // kind=reply, the receiving poller would skip it (replies are
+        // data-only, by design) and the original task would never resume.
+        // kind=action makes the messenger invoke the processor, giving the
+        // agent a chance to read the thread for context and act on the answer.
+        // reply_policy=NO_REPLY prevents a reply storm — the receiving
+        // messenger will suppress any outbound reply (issue #15 enforcement).
         String body = "{\"to\":\"" + toNode + "\","
             + "\"from\":\"" + config.nodeName + "\","
             + "\"content\":\"" + Json.escape(replyContent) + "\","
-            + "\"kind\":\"reply\","
+            + "\"kind\":\"action\","
             + "\"reply_policy\":\"NO_REPLY\","
             + "\"in_reply_to\":\"" + Json.escape(inReplyTo) + "\","
             + "\"thread_id\":" + threadId + "}";
