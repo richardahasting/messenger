@@ -20,9 +20,11 @@ import java.util.logging.Logger;
  * purpose-built messages table, which provides native thread_id tracking,
  * inbox-style retrieval, and proper delivery state.
  *
- * KNOWN LIMITATION: there is no "reset to pending" in the messages table API.
- * If processing fails after markDelivered(), the message stays in "delivered"
- * state and will not be retried automatically. See MessagePoller for details.
+ * Retry contract: a message claimed via markDelivered() that then fails
+ * processing is returned to "pending" by resetDelivered() (via the OpenBrain
+ * mark_pending tool) so the next poll retries it. Only if that reset is
+ * unavailable does the message fall through to the dead-letter path. See
+ * MessagePoller for details.
  *
  * FIXED (2026-04-13): send_message previously returned None on macmini due to a
  * PostgreSQL CTE snapshot-isolation bug in tools/messaging.py. The outer UPDATE
@@ -188,9 +190,8 @@ public class OpenBrainStore {
      * This is the atomic "claim" step — once delivered, subsequent get_inbox
      * calls will not return this message, preventing duplicate processing.
      *
-     * NOTE: Unlike the previous claimMessage() / resetMessage() pair, the
-     * messages table has no "reset to pending" operation. If processing fails
-     * after markDelivered(), the message stays in "delivered" state. See
+     * NOTE: if processing fails after markDelivered(), {@link #resetDelivered}
+     * returns the message to "pending" so it is retried on the next poll. See
      * MessagePoller for how this case is handled.
      *
      * Returns true if the server accepted the update, false on network error.
@@ -224,30 +225,54 @@ public class OpenBrainStore {
     }
 
     /**
-     * Reset a "delivered" message back to "pending" for retry.
+     * Reset a "delivered" message back to "pending" for retry (messenger#25).
      *
-     * NOT IMPLEMENTED — the OpenBrain messages API has no mark_pending operation.
-     * This stub documents the required capability and owns the correct call site.
-     * When macmini adds mark_pending to the OpenBrain MCP, replace the body with:
-     *
-     *   String body = "{\"tool\":\"mark_pending\",\"message_id\":%d}".formatted(messageId);
-     *   POST to mcpUrl with brainKey header
-     *   return resp.statusCode() == 200;
+     * Calls the OpenBrain {@code mark_pending} tool (openbrain-mcp#33), the
+     * mirror of {@link #markDelivered}. The server only transitions a message
+     * that is currently {@code delivered}; if the row is in any other state
+     * (e.g. already {@code archived}) it returns an {@code error} envelope and
+     * we report failure so the caller dead-letters rather than silently drops.
      *
      * Callers check the return value:
      *   true  → message is pending again; will be retried on the next poll
-     *   false → reset unavailable; caller falls through to the dead-letter path
+     *   false → reset unavailable/rejected; caller falls through to dead-letter
      *
-     * Feature request filed: OpenBrain thought #mark-pending-feature-request
-     * See ARCHITECTURE.md §4.3 for the failure contract this enables.
-     *
-     * @return false always (not implemented)
+     * @return true if the message was returned to pending, false otherwise
      */
     public boolean resetDelivered(int messageId) {
-        // TODO: implement when macmini adds mark_pending to the messages API
-        log.warning("resetDelivered() not implemented — message_id=" + messageId
-            + " remains 'delivered'; falling through to dead-letter path");
-        return false;
+        try {
+            String body = """
+                {"tool":"mark_pending","message_id":%d}
+                """.formatted(messageId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                log.warning("resetDelivered: mark_pending HTTP " + resp.statusCode()
+                    + " for message_id=" + messageId + " — falling through to dead-letter");
+                return false;
+            }
+            // mark_pending returns an {"error":...} envelope (HTTP 200) when the
+            // message was not in 'delivered' state. Treat that as "cannot retry".
+            if (resp.body() != null && resp.body().contains("\"error\"")) {
+                log.warning("resetDelivered: mark_pending rejected message_id=" + messageId
+                    + ": " + resp.body() + " — falling through to dead-letter");
+                return false;
+            }
+            log.info("Reset message " + messageId + " to pending — will retry on next poll");
+            return true;
+        } catch (Exception e) {
+            log.warning("resetDelivered failed for message_id=" + messageId
+                + ": " + e.getMessage() + " — falling through to dead-letter");
+            return false;
+        }
     }
 
     /**
