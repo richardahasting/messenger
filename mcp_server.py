@@ -86,7 +86,16 @@ def msg_health() -> dict:
 @mcp.tool()
 def msg_ping() -> dict:
     """Quick liveness check — is the local messenger daemon running?"""
-    return _get("/ping")
+    # Older daemons answer /ping with bare text "pong" (not JSON). Tolerate both
+    # so a version skew between the MCP wrapper and the daemon can't break the
+    # liveness probe. See messenger#27.
+    with httpx.Client(timeout=10) as client:
+        r = client.get(f"{MESSENGER_URL}/ping")
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            return {"status": "ok", "response": r.text.strip()}
 
 
 # --- Ask User (via Telegram) ---

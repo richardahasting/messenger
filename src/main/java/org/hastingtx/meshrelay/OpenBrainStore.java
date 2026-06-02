@@ -226,28 +226,43 @@ public class OpenBrainStore {
     /**
      * Reset a "delivered" message back to "pending" for retry.
      *
-     * NOT IMPLEMENTED — the OpenBrain messages API has no mark_pending operation.
-     * This stub documents the required capability and owns the correct call site.
-     * When macmini adds mark_pending to the OpenBrain MCP, replace the body with:
-     *
-     *   String body = "{\"tool\":\"mark_pending\",\"message_id\":%d}".formatted(messageId);
-     *   POST to mcpUrl with brainKey header
-     *   return resp.statusCode() == 200;
+     * Calls the OpenBrain {@code mark_pending} MCP tool (added on macmini).
+     * On success the message is eligible for redelivery on the next poll cycle,
+     * instead of being silently dead-lettered after a processing failure.
      *
      * Callers check the return value:
      *   true  → message is pending again; will be retried on the next poll
-     *   false → reset unavailable; caller falls through to the dead-letter path
+     *   false → reset unavailable (network error / non-200); caller falls
+     *           through to the dead-letter path
      *
-     * Feature request filed: OpenBrain thought #mark-pending-feature-request
-     * See ARCHITECTURE.md §4.3 for the failure contract this enables.
-     *
-     * @return false always (not implemented)
+     * @return true if the server accepted the reset, false otherwise
      */
     public boolean resetDelivered(int messageId) {
-        // TODO: implement when macmini adds mark_pending to the messages API
-        log.warning("resetDelivered() not implemented — message_id=" + messageId
-            + " remains 'delivered'; falling through to dead-letter path");
-        return false;
+        try {
+            String body = """
+                {"tool":"mark_pending","message_id":%d}
+                """.formatted(messageId);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(mcpUrl))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("x-brain-key", brainKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                log.warning("resetDelivered failed for message " + messageId
+                    + ": HTTP " + resp.statusCode());
+                return false;
+            }
+            log.info("Reset message " + messageId + " to pending for retry");
+            return true;
+        } catch (Exception e) {
+            log.warning("resetDelivered failed for message " + messageId + ": " + e.getMessage());
+            return false;
+        }
     }
 
     /**
