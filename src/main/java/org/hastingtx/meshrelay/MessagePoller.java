@@ -13,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -437,12 +438,22 @@ public class MessagePoller implements Runnable {
                         processClaimed(msg);
                     } catch (Throwable t) {
                         // processClaimed handles its own exceptions; last-resort guard.
-                        log.warning("Unexpected error processing message_id=" + msg.messageId()
-                            + " thread_id=" + threadId + ": " + t);
-                    } finally {
-                        inFlight.remove(msg.messageId());
+                        log.log(Level.WARNING, "Unexpected error processing message_id="
+                            + msg.messageId() + " thread_id=" + threadId, t);
                     }
-                }, processingPool);
+                }, processingPool)
+                .whenComplete((r, e) -> {
+                    // Runs on both normal completion AND pool-rejection (when
+                    // thenRunAsync completes the future exceptionally instead of
+                    // submitting the task). This is the only reliable place to
+                    // clear inFlight — the task lambda's finally never runs on
+                    // RejectedExecutionException.
+                    inFlight.remove(msg.messageId());
+                    if (e != null) {
+                        log.log(Level.WARNING, "Dispatch failed for message_id="
+                            + msg.messageId() + " thread_id=" + threadId, e);
+                    }
+                });
             // Prune the map entry once this chain drains, unless a later message
             // has already extended it (then the map holds the newer tail).
             next.whenComplete((r, e) ->
@@ -637,10 +648,10 @@ public class MessagePoller implements Runnable {
             log.info("Processed message thread_id=" + threadId
                 + " from=" + msg.fromNode()
                 + " total_processed=" + processed);
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+        } catch (Throwable t) {
+            if (t instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warning("Failed to process message thread_id=" + threadId
-                + " messageId=" + msg.messageId() + ": " + e.getMessage());
+                + " messageId=" + msg.messageId() + ": " + t.getMessage());
             // Return the message to pending so it can be retried (resetDelivered
             // calls mark_pending). Only if that reset is unavailable do we
             // dead-letter: archive to clear the "delivered" limbo, then log to
@@ -649,7 +660,7 @@ public class MessagePoller implements Runnable {
                 log.warning("Reset unavailable — archiving as dead-letter:"
                     + " thread_id=" + threadId + " messageId=" + msg.messageId());
                 brain.markArchived(msg.messageId());
-                brain.storeDeadLetter(msg, e.getMessage());
+                brain.storeDeadLetter(msg, t.getMessage());
             }
             // If reset succeeded, message returns to pending and will be
             // retried on the next poll cycle.
