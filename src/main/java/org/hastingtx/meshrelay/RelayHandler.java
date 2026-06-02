@@ -22,11 +22,15 @@ import java.util.logging.Logger;
  *
  * Flow:
  *   1. Store full message in OpenBrain → receive thread_id
- *   2. Send a tiny wake-up ping to the target peer: {from, thread_id}
- *   3. Return {thread_id, stored, wakeup_sent} to caller
+ *   2. Dispatch a tiny wake-up ping to the target peer ({from, thread_id})
+ *      on a background virtual thread
+ *   3. Return {thread_id, stored, wakeup_dispatched} to caller immediately
  *
- * The message is durable after step 1. A failed wake-up (step 2) is NOT
- * a delivery failure — the peer will pick up the message on its next poll.
+ * The message is durable after step 1. The wake-up (step 2) is a best-effort
+ * latency optimisation — the peer will pick up the message on its next poll
+ * regardless — so it runs asynchronously and never delays (or fails) the
+ * response. Running it inline previously coupled it to the caller's HTTP
+ * timeout and dead-lettered already-stored replies (messenger#24).
  *
  * Expected request body:
  * {
@@ -37,9 +41,9 @@ import java.util.logging.Logger;
  *
  * Response:
  * {
- *   "thread_id":    462,
- *   "stored":       true,
- *   "wakeup_sent":  true
+ *   "thread_id":         462,
+ *   "stored":            true,
+ *   "wakeup_dispatched": true
  * }
  */
 public class RelayHandler implements HttpHandler {
@@ -148,18 +152,33 @@ public class RelayHandler implements HttpHandler {
             return;
         }
 
-        // --- Step 2: Send wake-up ping to peer ---
-        // Best-effort with retries. Failure here is NOT a delivery failure.
-        boolean wakeupSent = sendWakeup(toNode, targetUrl, fromNode, stored.threadId());
+        // --- Step 2: Wake up the peer asynchronously ---
+        // The message is durable after step 1, so the wake-up is a pure latency
+        // optimisation — the peer's poll loop is the guaranteed delivery path.
+        // It MUST NOT run on this request thread: a slow or unreachable peer
+        // makes sendWakeup() retry for ~12-16s (3 attempts × connect/request
+        // timeouts + backoff), which would push this handler past the caller's
+        // HTTP timeout (ClaudeCliProcessor.sendReply caps the POST at 15s). The
+        // caller would then see a timeout and dead-letter a reply that was
+        // already durably stored above — the root cause of the 2026-05-29
+        // lost-email incident (messenger#24). Dispatching on a virtual thread
+        // lets us return 200 the instant the message is durable.
+        final String wakePeer   = toNode;
+        final String wakeUrl    = targetUrl;
+        final String wakeFrom   = fromNode;
+        final long   wakeThread = stored.threadId();
+        Thread.ofVirtual()
+            .name("wakeup-" + wakePeer + "-" + wakeThread)
+            .start(() -> sendWakeup(wakePeer, wakeUrl, wakeFrom, wakeThread));
 
-        // --- Step 3: Respond to caller ---
+        // --- Step 3: Respond to caller immediately (message already durable) ---
         String response = """
-            {"thread_id":%d,"message_id":%d,"stored":true,"wakeup_sent":%b}
-            """.formatted(stored.threadId(), stored.messageId(), wakeupSent).trim();
+            {"thread_id":%d,"message_id":%d,"stored":true,"wakeup_dispatched":true}
+            """.formatted(stored.threadId(), stored.messageId()).trim();
 
         byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        // 200 whether or not wake-up succeeded — message is stored either way
+        // 200 as soon as the message is durable — the wake-up runs in the background
         exchange.sendResponseHeaders(200, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
