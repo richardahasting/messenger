@@ -53,6 +53,14 @@ public class PeerConfig {
     public final int    claudeTimeoutMinutes;
     public final int    sessionTtlMinutes;
     public final int    reaperIntervalMinutes;
+    /**
+     * Max number of messages processed concurrently across all threads.
+     * Bounds simultaneous {@code claude -p} subprocesses so a burst of work
+     * can't exhaust the machine. A single long-running task no longer blocks
+     * unrelated threads (see messenger#27); this cap keeps that concurrency
+     * from running away. Default 4.
+     */
+    public final int    maxConcurrentProcessing;
     /** Optional personality/voice for this node's agent. Null for default. */
     public final String personality;
 
@@ -60,6 +68,7 @@ public class PeerConfig {
                        String openBrainUrl, String openBrainKey, String source,
                        String processor, String claudeModel, int claudeTimeoutMinutes,
                        int sessionTtlMinutes, int reaperIntervalMinutes,
+                       int maxConcurrentProcessing,
                        String personality) {
         this.nodeName              = nodeName;
         this.listenPort            = listenPort;
@@ -72,6 +81,7 @@ public class PeerConfig {
         this.claudeTimeoutMinutes  = claudeTimeoutMinutes;
         this.sessionTtlMinutes     = sessionTtlMinutes;
         this.reaperIntervalMinutes = reaperIntervalMinutes;
+        this.maxConcurrentProcessing = maxConcurrentProcessing;
         this.personality           = personality;
     }
 
@@ -182,11 +192,12 @@ public class PeerConfig {
         int    claudeTimeoutMinutes = cfg.getInt("claude_timeout_minutes", 12);
         int    sessionTtlMinutes    = cfg.getInt("session_ttl_minutes", 240);
         int    reaperIntervalMinutes = cfg.getInt("reaper_interval_minutes", 5);
+        int    maxConcurrentProcessing = cfg.getInt("max_concurrent_processing", 4);
         String personality          = cfg.getString("personality");
 
         return new PeerConfig(nodeName, listenPort, peers, obUrl, obKey, source,
             processor, claudeModel, claudeTimeoutMinutes, sessionTtlMinutes,
-            reaperIntervalMinutes, personality);
+            reaperIntervalMinutes, maxConcurrentProcessing, personality);
     }
 
     private static void writeCache(Path cacheFile, String content) {
@@ -210,6 +221,7 @@ public class PeerConfig {
             + ", claudeModel=" + claudeModel
             + ", timeout=" + claudeTimeoutMinutes + "m"
             + ", sessionTTL=" + sessionTtlMinutes + "m"
-            + ", reaperInterval=" + reaperIntervalMinutes + "m}";
+            + ", reaperInterval=" + reaperIntervalMinutes + "m"
+            + ", maxConcurrent=" + maxConcurrentProcessing + "}";
     }
 }

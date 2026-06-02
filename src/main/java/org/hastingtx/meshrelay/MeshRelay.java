@@ -147,7 +147,12 @@ public class MeshRelay {
         server.createContext("/wake",      new WakeHandler(config, poller));
         server.createContext("/health",    new HealthHandler(config, poller, java.time.Instant.now(), processor));
         server.createContext("/ping", exchange -> {
-            byte[] pong = "pong".getBytes(StandardCharsets.UTF_8);
+            // Return JSON (not bare "pong") so JSON-only clients like the Python
+            // MCP wrapper's msg_ping can parse the response. See messenger#27.
+            byte[] pong = ("{\"status\":\"ok\",\"node\":\"" + config.nodeName
+                + "\",\"version\":\"" + Version.VERSION + "\",\"response\":\"pong\"}")
+                .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, pong.length);
             exchange.getResponseBody().write(pong);
             exchange.close();

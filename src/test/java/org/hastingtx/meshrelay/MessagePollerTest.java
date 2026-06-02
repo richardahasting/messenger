@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Timeout;
 import java.net.http.HttpClient;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
@@ -132,10 +133,12 @@ class MessagePollerTest {
      */
     static class RecordingStore extends OpenBrainStore {
         final List<PendingMessage> inbox = new ArrayList<>();
-        final List<Integer> delivered = new ArrayList<>();
-        final List<Integer> archived  = new ArrayList<>();
-        final List<Integer> watermarks = new ArrayList<>();
-        boolean drained = false;
+        // Written from processing virtual threads (messenger#27) — must be
+        // thread-safe so concurrent record + assertion reads don't corrupt.
+        final List<Integer> delivered = new CopyOnWriteArrayList<>();
+        final List<Integer> archived  = new CopyOnWriteArrayList<>();
+        final List<Integer> watermarks = new CopyOnWriteArrayList<>();
+        volatile boolean drained = false;
 
         RecordingStore(PeerConfig cfg) {
             super(HttpClient.newHttpClient(), cfg);
@@ -188,7 +191,7 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
-    void peerBroadcastIsStillProcessedNormally() {
+    void peerBroadcastIsStillProcessedNormally() throws Exception {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
@@ -197,6 +200,7 @@ class MessagePollerTest {
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
         poller.triggerPoll();
+        assertTrue(poller.awaitProcessingComplete(5000), "processing should drain");
 
         assertEquals(1, proc.processCount.get(),
             "peer broadcasts must still be processed");
@@ -249,7 +253,7 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
-    void actionMessageIsProcessedNormally() {
+    void actionMessageIsProcessedNormally() throws Exception {
         // Regression guard: kind=action (the default) must still flow through processor.
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
@@ -261,6 +265,7 @@ class MessagePollerTest {
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
         poller.triggerPoll();
+        assertTrue(poller.awaitProcessingComplete(5000), "processing should drain");
 
         assertEquals(1, proc.processCount.get(),
             "action messages must go through the processor");
@@ -268,7 +273,7 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
-    void oldMessageWithoutHeaderProcessesAsAction() {
+    void oldMessageWithoutHeaderProcessesAsAction() throws Exception {
         // Messages from pre-1.1.0 daemons don't have a version header at all.
         // Must default to action so we don't silently drop them.
         PeerConfig cfg = testConfig("linuxserver");
@@ -279,6 +284,7 @@ class MessagePollerTest {
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
         poller.triggerPoll();
+        assertTrue(poller.awaitProcessingComplete(5000), "processing should drain");
 
         assertEquals(1, proc.processCount.get(),
             "headerless messages default to action — processor must still run");
@@ -328,7 +334,7 @@ class MessagePollerTest {
 
     @Test
     @Timeout(10)
-    void mixedInboxProcessesPeerMessagesAndSkipsSelfBroadcast() {
+    void mixedInboxProcessesPeerMessagesAndSkipsSelfBroadcast() throws Exception {
         PeerConfig cfg = testConfig("linuxserver");
         RecordingStore brain = new RecordingStore(cfg);
         brain.inbox.add(new OpenBrainStore.PendingMessage(
@@ -339,6 +345,7 @@ class MessagePollerTest {
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
         poller.triggerPoll();
+        assertTrue(poller.awaitProcessingComplete(5000), "processing should drain");
 
         assertEquals(1, proc.processCount.get(),
             "only the peer direct message should reach the processor");
@@ -346,5 +353,70 @@ class MessagePollerTest {
         assertEquals(List.of(601), brain.archived);
         assertEquals(List.of(600), brain.watermarks,
             "only the skipped self-broadcast advances the watermark here");
+    }
+
+    /**
+     * Processor that blocks indefinitely for one designated thread_id (the
+     * "slow" task) and completes instantly for any other thread. Lets us prove
+     * a stuck task on one thread doesn't hold up another.
+     */
+    static class GatedProcessor implements MessageProcessor {
+        final long slowThreadId;
+        final CountDownLatch gate        = new CountDownLatch(1);
+        final CountDownLatch slowStarted = new CountDownLatch(1);
+        final AtomicInteger  fastDone    = new AtomicInteger(0);
+
+        GatedProcessor(long slowThreadId) { this.slowThreadId = slowThreadId; }
+
+        @Override
+        public void process(OpenBrainStore.PendingMessage m) throws Exception {
+            if (m.threadId() == slowThreadId) {
+                slowStarted.countDown();
+                gate.await();              // simulate a long-running agent
+            } else {
+                fastDone.incrementAndGet(); // a quick task on another thread
+            }
+        }
+    }
+
+    /**
+     * Core regression for messenger#27: a long-running task on one thread must
+     * NOT block an unrelated short task on a different thread. This is exactly
+     * the thread 811 (FATS project) vs thread 812 (limerick) scenario.
+     */
+    @Test
+    @Timeout(15)
+    void longTaskOnOneThreadDoesNotBlockAnotherThread() throws Exception {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String slow = RelayHandler.stampVersionHeader("long project kickoff", "macmini", "1.1.3", "action");
+        String fast = RelayHandler.stampVersionHeader("quick limerick please", "macmini", "1.1.3", "action");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(811, 811L, "macmini", "linuxserver", slow, "pending"));
+        brain.inbox.add(new OpenBrainStore.PendingMessage(812, 812L, "macmini", "linuxserver", fast, "pending"));
+
+        GatedProcessor proc = new GatedProcessor(811L);
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();
+
+        assertTrue(proc.slowStarted.await(5, TimeUnit.SECONDS),
+            "the slow task (thread 811) should have started");
+
+        // While 811 is wedged, the fast task on thread 812 must still complete.
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (proc.fastDone.get() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, proc.fastDone.get(),
+            "thread 812 must complete while thread 811 is still blocked (messenger#27)");
+        assertTrue(brain.archived.contains(812),
+            "the fast message should be archived even though the slow one is stuck");
+        assertFalse(brain.archived.contains(811),
+            "the slow message must NOT be archived yet — it's still blocked");
+
+        // Release the slow task and confirm everything drains.
+        proc.gate.countDown();
+        assertTrue(poller.awaitProcessingComplete(5000), "all processing should drain");
+        assertTrue(brain.archived.contains(811),
+            "the slow message archives once it finally finishes");
     }
 }

@@ -5,7 +5,9 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
@@ -26,12 +28,23 @@ import java.util.logging.Logger;
  *      after the current one completes. N simultaneous wake-ups collapse
  *      into at most 2 sequential runs — no double-processing.
  *
- *   2. Per-thread serialization:
+ *   2. Per-thread serialization with cross-thread concurrency:
  *      Messages belonging to the same conversation thread (same thread_id)
  *      are processed one at a time, in arrival order. This ensures an agent
  *      processing reply B always sees reply A fully committed first.
- *      Different threads are processed concurrently with no ordering
- *      constraint between them.
+ *      Different threads are processed concurrently — each message is handed
+ *      to its own virtual thread, so a long-running task on one thread does
+ *      NOT block other threads (or the poll loop itself). This is the fix for
+ *      messenger#27, where a multi-minute project agent on one thread left an
+ *      unrelated connectivity test (thread 812) stuck pending for the full
+ *      claude timeout. Total concurrency is bounded by a semaphore
+ *      (config.maxConcurrentProcessing) so a burst can't exhaust the machine.
+ *
+ *   3. Dispatch is non-blocking:
+ *      poll() claims each message into an in-flight set and dispatches it,
+ *      then returns immediately. The in-flight set prevents a subsequent
+ *      overlapping poll from re-dispatching a message before it has been
+ *      marked delivered.
  */
 public class MessagePoller implements Runnable {
 
@@ -43,8 +56,12 @@ public class MessagePoller implements Runnable {
     private final MessageProcessor processor;
 
     private volatile boolean running  = true;
-    private Instant lastPollTime      = Instant.EPOCH;
-    private int     totalProcessed    = 0;
+    // lastPollTime is written by the poll loop and read by the health endpoint;
+    // totalProcessed is now incremented from many processing virtual threads
+    // (messenger#27) — both must be safe for cross-thread visibility.
+    private volatile Instant lastPollTime = Instant.EPOCH;
+    private final java.util.concurrent.atomic.AtomicInteger totalProcessed =
+        new java.util.concurrent.atomic.AtomicInteger(0);
 
     // ── Concurrency controls ──────────────────────────────────────────────
 
@@ -68,6 +85,20 @@ public class MessagePoller implements Runnable {
      */
     private final ConcurrentHashMap<Long, ReentrantLock> threadLocks = new ConcurrentHashMap<>();
 
+    /**
+     * Message ids currently dispatched to a processing virtual thread (claimed
+     * but not yet completed). Guards against an overlapping poll re-dispatching
+     * the same message in the window before markDelivered() lands. Entries are
+     * removed when processing finishes (success, failure, or dead-letter).
+     */
+    private final Set<Integer> inFlight = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Bounds the number of messages processed concurrently. Each permit gates
+     * one {@code claude -p} subprocess. Sized from config.maxConcurrentProcessing.
+     */
+    private final Semaphore processingSlots;
+
     // ── Per-sender rate limiting ──────────────────────────────────────────
     // Prevents chatty agents (e.g. Gemma hallucinating tasks) from flooding
     // the processor. 3 messages per 10 minutes per sender.
@@ -82,6 +113,10 @@ public class MessagePoller implements Runnable {
         this.config    = config;
         this.brain     = brain;
         this.processor = processor;
+        int slots = Math.max(1, config.maxConcurrentProcessing);
+        // Fair semaphore: permits are granted in request order so a short task
+        // that arrived first isn't starved behind later long ones.
+        this.processingSlots = new Semaphore(slots, true);
     }
 
     /** Start the polling loop on a virtual thread. Returns immediately. */
@@ -218,8 +253,38 @@ public class MessagePoller implements Runnable {
                 brain.markArchived(msg.messageId());
                 continue;
             }
-            processWithThreadLock(msg);
+            dispatch(msg);
         }
+    }
+
+    /**
+     * Hand a message off to a background virtual thread for processing, then
+     * return immediately so the poll loop is never blocked by a slow task.
+     *
+     * The in-flight set is the dedup guard: if this message id is already being
+     * processed (e.g. an overlapping poll saw it before markDelivered landed),
+     * skip the duplicate dispatch. Same-thread ordering and serialization are
+     * still enforced inside processWithThreadLock via the per-thread lock; the
+     * global concurrency cap is enforced there via the processing semaphore.
+     */
+    private void dispatch(OpenBrainStore.PendingMessage msg) {
+        if (!inFlight.add(msg.messageId())) {
+            log.fine("Already in-flight — skipping duplicate dispatch message_id="
+                + msg.messageId() + " thread_id=" + msg.threadId());
+            return;
+        }
+        Thread.ofVirtual().name("msg-proc-" + msg.threadId()).start(() -> {
+            try {
+                processWithThreadLock(msg);
+            } catch (Throwable t) {
+                // processWithThreadLock handles its own exceptions; this is a
+                // last-resort guard so a bug can never leak a stuck in-flight entry.
+                log.warning("Unexpected error processing message_id=" + msg.messageId()
+                    + " thread_id=" + msg.threadId() + ": " + t);
+            } finally {
+                inFlight.remove(msg.messageId());
+            }
+        });
     }
 
     /**
@@ -262,7 +327,10 @@ public class MessagePoller implements Runnable {
      */
     private void processWithThreadLock(OpenBrainStore.PendingMessage msg) {
         long threadId = msg.threadId();
-        ReentrantLock lock = threadLocks.computeIfAbsent(threadId, id -> new ReentrantLock());
+        // Fair lock: when several messages of the same thread contend, they
+        // acquire in arrival order, preserving per-thread message ordering even
+        // though each runs on its own virtual thread.
+        ReentrantLock lock = threadLocks.computeIfAbsent(threadId, id -> new ReentrantLock(true));
         boolean acquired;
         try {
             acquired = lock.tryLock(THREAD_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
@@ -301,16 +369,24 @@ public class MessagePoller implements Runnable {
             }
 
             try {
-                processor.process(msg);
+                // Bound concurrent claude subprocesses across all threads.
+                // Acquired only around the expensive processor call, not the
+                // cheap OpenBrain bookkeeping, so permits free up promptly.
+                processingSlots.acquire();
+                try {
+                    processor.process(msg);
+                } finally {
+                    processingSlots.release();
+                }
                 brain.markArchived(msg.messageId());
                 if ("all".equals(msg.toNode())) {
                     brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
                 }
                 recordProcessed(msg.fromNode());
-                totalProcessed++;
+                int processed = totalProcessed.incrementAndGet();
                 log.info("Processed message thread_id=" + threadId
                     + " from=" + msg.fromNode()
-                    + " total_processed=" + totalProcessed);
+                    + " total_processed=" + processed);
             } catch (Exception e) {
                 log.warning("Failed to process message thread_id=" + threadId
                     + " messageId=" + msg.messageId() + ": " + e.getMessage());
@@ -338,5 +414,25 @@ public class MessagePoller implements Runnable {
     public void stop() { running = false; }
 
     public Instant getLastPollTime()   { return lastPollTime; }
-    public int     getTotalProcessed() { return totalProcessed; }
+    public int     getTotalProcessed() { return totalProcessed.get(); }
+
+    /** Number of messages currently dispatched but not yet finished processing. */
+    int inFlightCount() { return inFlight.size(); }
+
+    /**
+     * Block until all dispatched messages have finished processing, or the
+     * timeout elapses. Processing now runs on background virtual threads
+     * (messenger#27), so callers that need to observe the terminal state —
+     * tests, graceful shutdown — use this to await quiescence.
+     *
+     * @return true if processing drained within the timeout, false otherwise
+     */
+    boolean awaitProcessingComplete(long timeoutMillis) throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+        while (!inFlight.isEmpty()) {
+            if (System.nanoTime() >= deadline) return false;
+            Thread.sleep(10);
+        }
+        return true;
+    }
 }
