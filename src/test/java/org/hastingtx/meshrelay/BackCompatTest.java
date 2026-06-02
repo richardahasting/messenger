@@ -90,6 +90,24 @@ class BackCompatTest {
             node, "http://brain", "k", "test");
     }
 
+    /**
+     * Poll and wait for any dispatched processing to drain. Processing runs on
+     * background virtual threads (messenger#27), so assertions on processCount
+     * must wait for quiescence. No-op for skip-path messages.
+     */
+    private static void pump(MessagePoller poller) {
+        poller.triggerPoll();
+        long deadline = System.currentTimeMillis() + 5000;
+        try {
+            while (poller.inFlightCount() > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        assertEquals(0, poller.inFlightCount(), "processing should drain within timeout");
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // A. Pre-v1.2 sender → v1.2 receiver
     //    (no new fields on the wire; receiver fills in spec defaults)
@@ -148,7 +166,7 @@ class BackCompatTest {
             500, 500L, "macbook-air", "linuxserver", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(1, proc.processCount.get(),
             "pre-v1.2 action message must run processor unchanged");
@@ -165,7 +183,7 @@ class BackCompatTest {
             501, 501L, "macbook-air", "linuxserver", "plain legacy body", "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(1, proc.processCount.get(),
             "headerless legacy message must fall back to kind=action");
@@ -184,7 +202,7 @@ class BackCompatTest {
             502, 502L, "macbook-air", "linuxserver", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(0, proc.processCount.get(),
             "pre-v1.2 ack must not reach processor");
@@ -281,7 +299,7 @@ class BackCompatTest {
             600, 600L, "linuxserver", "macbook-air", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(1, proc.processCount.get(),
             "v1.2 → mocked v1.1.6: action must dispatch");
@@ -302,7 +320,7 @@ class BackCompatTest {
             601, 601L, "macbook-air", "linuxserver", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(1, proc.processCount.get(),
             "mocked v1.1.6 → v1.2: action must run processor with defaults");
@@ -325,7 +343,7 @@ class BackCompatTest {
             602, 602L, "macbook-air", "linuxserver", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(1, proc.processCount.get(),
             "fully stamped v1.2 action must dispatch normally");
@@ -350,7 +368,7 @@ class BackCompatTest {
             603, 603L, "macbook-air", "linuxserver", content, "pending"));
 
         CountingProcessor proc = new CountingProcessor();
-        new MessagePoller(cfg, brain, proc).triggerPoll();
+        pump(new MessagePoller(cfg, brain, proc));
 
         assertEquals(0, proc.processCount.get(),
             "NO_REPLY action must NEVER reach the processor");

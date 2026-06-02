@@ -5,11 +5,14 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
 /**
@@ -27,12 +30,24 @@ import java.util.logging.Logger;
  *      after the current one completes. N simultaneous wake-ups collapse
  *      into at most 2 sequential runs — no double-processing.
  *
- *   2. Per-thread serialization:
+ *   2. Per-thread serialization with cross-thread concurrency:
  *      Messages belonging to the same conversation thread (same thread_id)
- *      are processed one at a time, in arrival order. This ensures an agent
- *      processing reply B always sees reply A fully committed first.
- *      Different threads are processed concurrently with no ordering
- *      constraint between them.
+ *      are processed one at a time, in arrival order, via a per-thread serial
+ *      task chain. This ensures an agent processing reply B always sees reply
+ *      A fully committed first. Different threads process concurrently on
+ *      background virtual threads, so a long-running task on one thread never
+ *      blocks another thread — or the poll loop itself. This is the fix for
+ *      messenger#27, where a multi-minute project agent on one thread left an
+ *      unrelated connectivity test (thread 812) stuck pending for the full
+ *      claude timeout. Total concurrency is bounded by a semaphore
+ *      (config.maxConcurrentProcessing) so a burst can't exhaust the machine.
+ *
+ *   3. Non-blocking dispatch:
+ *      poll() runs the cheap synchronous filters (status, dedup, MAX_TURNS,
+ *      kind, suppression, rate limit) inline, then hands the expensive
+ *      processor call to the per-thread chain and returns immediately. An
+ *      in-flight set keyed by message_id prevents an overlapping poll from
+ *      re-dispatching a message before it has been marked delivered.
  */
 public class MessagePoller implements Runnable {
 
@@ -65,13 +80,13 @@ public class MessagePoller implements Runnable {
     private final DedupCache       dedupCache;
 
     private volatile boolean running  = true;
-    private Instant lastPollTime      = Instant.EPOCH;
-    private int     totalProcessed    = 0;
+    // lastPollTime is written by the poll loop and read by the health endpoint;
+    // totalProcessed is incremented from many processing virtual threads
+    // (messenger#27) — both must be safe for cross-thread visibility.
+    private volatile Instant lastPollTime = Instant.EPOCH;
+    private final AtomicInteger totalProcessed = new AtomicInteger(0);
 
     // ── Concurrency controls ──────────────────────────────────────────────
-
-    /** How long to wait for a per-thread lock before giving up on this message. */
-    private static final long THREAD_LOCK_TIMEOUT_MINUTES = 12;
 
     /** True while a poll() run is executing. */
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
@@ -84,11 +99,33 @@ public class MessagePoller implements Runnable {
     private final AtomicBoolean pollPending = new AtomicBoolean(false);
 
     /**
-     * Per-thread locks: ensures messages with the same thread_id are processed
-     * sequentially. Locks are created on demand and removed after use to avoid
-     * unbounded map growth.
+     * Per-thread serial task chains: each thread_id maps to the tail of a
+     * CompletableFuture chain. A new message for a thread is appended after the
+     * current tail, so same-thread messages run strictly in arrival order while
+     * different threads run concurrently on {@link #processingPool}. Entries are
+     * pruned when their chain drains (see {@link #dispatch}).
      */
-    private final ConcurrentHashMap<Long, ReentrantLock> threadLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, CompletableFuture<Void>> threadChains = new ConcurrentHashMap<>();
+
+    /**
+     * Message ids currently dispatched to a chain (claimed but not yet finished).
+     * Guards against an overlapping poll re-dispatching a message in the window
+     * before markDelivered() lands. Entries are removed when processing finishes
+     * (success, failure, or dead-letter).
+     */
+    private final Set<Integer> inFlight = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Bounds the number of messages processed concurrently across all threads.
+     * Each permit gates one {@code claude -p} subprocess. Sized from
+     * config.maxConcurrentProcessing; fair so a task that queued earlier isn't
+     * starved behind later ones.
+     */
+    private final Semaphore processingSlots;
+
+    /** Virtual-thread pool that runs the per-thread chain stages. */
+    private final ExecutorService processingPool =
+        Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("msg-proc-", 0).factory());
 
     /**
      * Per-thread non-progress message counter for the {@link #MAX_TURNS_PER_THREAD}
@@ -124,6 +161,7 @@ public class MessagePoller implements Runnable {
         this.processor   = processor;
         this.relaySender = relaySender != null ? relaySender : RelaySender.NOOP;
         this.dedupCache  = dedupCache  != null ? dedupCache  : new DedupCache();
+        this.processingSlots = new Semaphore(Math.max(1, config.maxConcurrentProcessing), true);
     }
 
     /**
@@ -365,8 +403,52 @@ public class MessagePoller implements Runnable {
                 brain.markArchived(msg.messageId());
                 continue;
             }
-            processWithThreadLock(msg);
+            dispatch(msg);
         }
+    }
+
+    /**
+     * Hand a message off to its thread's serial chain for processing, then
+     * return immediately so the poll loop is never blocked by a slow task.
+     *
+     * The in-flight set is the dedup guard: if this message id is already being
+     * processed (e.g. an overlapping poll saw it before markDelivered landed),
+     * skip the duplicate dispatch. Same-thread ordering is guaranteed by
+     * appending to the thread's CompletableFuture chain; the global concurrency
+     * cap is enforced inside {@link #processClaimed} via the processing semaphore.
+     */
+    private void dispatch(OpenBrainStore.PendingMessage msg) {
+        if (!inFlight.add(msg.messageId())) {
+            log.fine("Already in-flight — skipping duplicate dispatch message_id="
+                + msg.messageId() + " thread_id=" + msg.threadId());
+            return;
+        }
+        long threadId = msg.threadId();
+        threadChains.compute(threadId, (tid, prev) -> {
+            // Chain after the current tail (or start fresh if the thread is idle).
+            // handle((r,e)->null) so a failed predecessor never breaks the successor.
+            CompletableFuture<Void> base = (prev == null || prev.isDone())
+                ? CompletableFuture.completedFuture(null)
+                : prev;
+            CompletableFuture<Void> next = base
+                .handle((r, e) -> null)
+                .thenRunAsync(() -> {
+                    try {
+                        processClaimed(msg);
+                    } catch (Throwable t) {
+                        // processClaimed handles its own exceptions; last-resort guard.
+                        log.warning("Unexpected error processing message_id=" + msg.messageId()
+                            + " thread_id=" + threadId + ": " + t);
+                    } finally {
+                        inFlight.remove(msg.messageId());
+                    }
+                }, processingPool);
+            // Prune the map entry once this chain drains, unless a later message
+            // has already extended it (then the map holds the newer tail).
+            next.whenComplete((r, e) ->
+                threadChains.computeIfPresent(threadId, (k, tail) -> tail == next ? null : tail));
+            return next;
+        });
     }
 
     /**
@@ -509,98 +591,96 @@ public class MessagePoller implements Runnable {
      * Messages with different thread_ids run concurrently.
      * Messages with the same thread_id are serialized.
      */
-    private void processWithThreadLock(OpenBrainStore.PendingMessage msg) {
+    private void processClaimed(OpenBrainStore.PendingMessage msg) {
         long threadId = msg.threadId();
-        ReentrantLock lock = threadLocks.computeIfAbsent(threadId, id -> new ReentrantLock());
-        boolean acquired;
-        try {
-            acquired = lock.tryLock(THREAD_LOCK_TIMEOUT_MINUTES, TimeUnit.MINUTES);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.warning("Interrupted waiting for thread lock thread_id=" + threadId
-                + " — skipping, will retry next poll");
-            return;
-        }
 
-        if (!acquired) {
-            // The previous message in this thread has been running for 15+ minutes.
-            // Leave this message unarchived so it will be retried next poll.
-            log.warning("Thread lock timeout (>" + THREAD_LOCK_TIMEOUT_MINUTES + "m) for thread_id="
-                + threadId + " from=" + msg.fromNode()
-                + " — skipping this cycle, will retry next poll");
+        // Claim the message before processing to prevent duplicate delivery.
+        // markDelivered (pending → delivered) is the atomic claim step — once
+        // claimed, subsequent polls won't see this message even if archiving
+        // later fails. If OpenBrain is unavailable here, skip and retry next poll.
+        if (!brain.markDelivered(msg.messageId())) {
+            log.warning("Could not mark message delivered thread_id=" + threadId
+                + " messageId=" + msg.messageId() + " — skipping, will retry next poll");
             return;
         }
 
         try {
-            // Claim the message before processing to prevent duplicate delivery.
-            // If OpenBrain is unavailable here, skip and retry next poll (still "active").
-            // Once claimed, subsequent polls won't see this message even if archiving later fails.
-            // Mark delivered (pending → delivered) before processing.
-            // This is the atomic "claim" step — prevents duplicate delivery if
-            // the poll runs again before we finish.
-            //
-            // NOTE: unlike the old claimMessage/resetMessage pair, the messages
-            // table has no "reset to pending" operation. If processing fails after
-            // markDelivered(), the message stays in "delivered" state and will NOT
-            // be retried by the normal poll path. Manual recovery would be needed.
-            if (!brain.markDelivered(msg.messageId())) {
-                log.warning("Could not mark message delivered thread_id=" + threadId
-                    + " messageId=" + msg.messageId() + " — skipping, will retry next poll");
-                return;
-            }
-
+            // Bound concurrent claude subprocesses across all threads. Acquired
+            // only around the expensive processor call, not the cheap OpenBrain
+            // bookkeeping, so permits free up promptly.
+            processingSlots.acquire();
             try {
                 processor.process(msg);
-                brain.markArchived(msg.messageId());
-                if ("all".equals(msg.toNode())) {
-                    brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
-                }
-                // v1.2 dedup cache (issue #16): record at minimum the
-                // "processed-no-response" sentinel for this key. Processors
-                // that emit an outbound reply (ClaudeCliProcessor,
-                // GemmaProcessor) overwrite the sentinel with the real
-                // response via dedupCache().put(...) once sendReply succeeds —
-                // see those classes. Sentinel placement here covers the
-                // processor-returned-no-output / no-reply paths so a
-                // duplicate is silently swallowed instead of re-running the
-                // processor.
-                String seqId = RelayHandler.extractHeaderField(msg.content(), "seq", null);
-                if (seqId != null && !seqId.isBlank()) {
-                    DedupCache.DedupKey key = new DedupCache.DedupKey(
-                        msg.fromNode(), msg.threadId(), seqId);
-                    if (!dedupCache.contains(key)) dedupCache.putSentinel(key);
-                }
-                recordProcessed(msg.fromNode());
-                totalProcessed++;
-                log.info("Processed message thread_id=" + threadId
-                    + " from=" + msg.fromNode()
-                    + " total_processed=" + totalProcessed);
-            } catch (Exception e) {
-                log.warning("Failed to process message thread_id=" + threadId
-                    + " messageId=" + msg.messageId() + ": " + e.getMessage());
-                // Attempt to reset to pending so the message can be retried.
-                // resetDelivered() is a stub — always returns false until macmini
-                // adds mark_pending to the OpenBrain MCP API (see OpenBrainStore).
-                if (!brain.resetDelivered(msg.messageId())) {
-                    // Reset unavailable — dead-letter: archive to clear "delivered"
-                    // limbo, then log to OpenBrain for auditability.
-                    log.warning("Reset unavailable — archiving as dead-letter:"
-                        + " thread_id=" + threadId + " messageId=" + msg.messageId());
-                    brain.markArchived(msg.messageId());
-                    brain.storeDeadLetter(msg, e.getMessage());
-                }
-                // If reset succeeded, message returns to pending and will be
-                // retried on the next poll cycle.
+            } finally {
+                processingSlots.release();
             }
-        } finally {
-            lock.unlock();
-            // Remove lock if no other thread is waiting on it
-            threadLocks.remove(threadId, lock);
+            brain.markArchived(msg.messageId());
+            if ("all".equals(msg.toNode())) {
+                brain.updateBroadcastWatermark(config.nodeName, msg.messageId());
+            }
+            // v1.2 dedup cache (issue #16): record at minimum the
+            // "processed-no-response" sentinel for this key. Processors
+            // that emit an outbound reply (ClaudeCliProcessor, GemmaProcessor)
+            // overwrite the sentinel with the real response via
+            // dedupCache().put(...) once sendReply succeeds — see those classes.
+            // Sentinel placement here covers the processor-returned-no-output /
+            // no-reply paths so a duplicate is silently swallowed instead of
+            // re-running the processor.
+            String seqId = RelayHandler.extractHeaderField(msg.content(), "seq", null);
+            if (seqId != null && !seqId.isBlank()) {
+                DedupCache.DedupKey key = new DedupCache.DedupKey(
+                    msg.fromNode(), msg.threadId(), seqId);
+                if (!dedupCache.contains(key)) dedupCache.putSentinel(key);
+            }
+            recordProcessed(msg.fromNode());
+            int processed = totalProcessed.incrementAndGet();
+            log.info("Processed message thread_id=" + threadId
+                + " from=" + msg.fromNode()
+                + " total_processed=" + processed);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            log.warning("Failed to process message thread_id=" + threadId
+                + " messageId=" + msg.messageId() + ": " + e.getMessage());
+            // Return the message to pending so it can be retried (resetDelivered
+            // calls mark_pending). Only if that reset is unavailable do we
+            // dead-letter: archive to clear the "delivered" limbo, then log to
+            // OpenBrain for auditability.
+            if (!brain.resetDelivered(msg.messageId())) {
+                log.warning("Reset unavailable — archiving as dead-letter:"
+                    + " thread_id=" + threadId + " messageId=" + msg.messageId());
+                brain.markArchived(msg.messageId());
+                brain.storeDeadLetter(msg, e.getMessage());
+            }
+            // If reset succeeded, message returns to pending and will be
+            // retried on the next poll cycle.
         }
     }
 
-    public void stop() { running = false; }
+    public void stop() {
+        running = false;
+        processingPool.shutdown();
+    }
 
     public Instant getLastPollTime()   { return lastPollTime; }
-    public int     getTotalProcessed() { return totalProcessed; }
+    public int     getTotalProcessed() { return totalProcessed.get(); }
+
+    /** Number of messages currently dispatched but not yet finished processing. */
+    int inFlightCount() { return inFlight.size(); }
+
+    /**
+     * Block until all dispatched messages have finished processing, or the
+     * timeout elapses. Processing runs on background virtual threads
+     * (messenger#27), so callers that need to observe the terminal state —
+     * tests, graceful shutdown — use this to await quiescence.
+     *
+     * @return true if processing drained within the timeout, false otherwise
+     */
+    boolean awaitProcessingComplete(long timeoutMillis) throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+        while (!inFlight.isEmpty()) {
+            if (System.nanoTime() >= deadline) return false;
+            Thread.sleep(10);
+        }
+        return true;
+    }
 }

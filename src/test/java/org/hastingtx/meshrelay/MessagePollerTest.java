@@ -7,6 +7,7 @@ import java.net.http.HttpClient;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
@@ -133,10 +134,12 @@ class MessagePollerTest {
      */
     static class RecordingStore extends OpenBrainStore {
         final List<PendingMessage> inbox = new ArrayList<>();
-        final List<Integer> delivered = new ArrayList<>();
-        final List<Integer> archived  = new ArrayList<>();
-        final List<Integer> watermarks = new ArrayList<>();
-        boolean drained = false;
+        // Written from processing virtual threads (messenger#27) — thread-safe
+        // so concurrent record + assertion reads don't corrupt.
+        final List<Integer> delivered = new CopyOnWriteArrayList<>();
+        final List<Integer> archived  = new CopyOnWriteArrayList<>();
+        final List<Integer> watermarks = new CopyOnWriteArrayList<>();
+        volatile boolean drained = false;
 
         RecordingStore(PeerConfig cfg) {
             super(HttpClient.newHttpClient(), cfg);
@@ -165,6 +168,25 @@ class MessagePollerTest {
             nodeName, "http://brain", "k", "test");
     }
 
+    /**
+     * Trigger a poll and wait for any dispatched processing to drain. Processing
+     * now runs on background virtual threads (messenger#27), so a test that
+     * asserts on processCount/delivered/archived must wait for quiescence. A
+     * no-op for skip-path messages (nothing dispatched → inFlightCount already 0).
+     */
+    private static void pump(MessagePoller poller) {
+        poller.triggerPoll();
+        long deadline = System.currentTimeMillis() + 5000;
+        try {
+            while (poller.inFlightCount() > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        assertEquals(0, poller.inFlightCount(), "processing should drain within timeout");
+    }
+
     @Test
     @Timeout(10)
     void selfBroadcastIsSkippedAndWatermarkAdvances() {
@@ -175,7 +197,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "processor must not run for self-broadcasts — prevents dead-letter loop");
@@ -197,7 +219,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(1, proc.processCount.get(),
             "peer broadcasts must still be processed");
@@ -219,7 +241,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "ack messages must NOT reach the processor (prevents reply-to-ack cascade)");
@@ -242,7 +264,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get());
         assertEquals(List.of(701), brain.archived);
@@ -261,7 +283,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(1, proc.processCount.get(),
             "action messages must go through the processor");
@@ -279,7 +301,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(1, proc.processCount.get(),
             "headerless messages default to action — processor must still run");
@@ -298,7 +320,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "archived messages must not reach the processor");
@@ -320,7 +342,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "in-flight (delivered) messages must not be double-processed");
@@ -344,7 +366,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "reply messages must not reach the processor");
@@ -364,7 +386,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "progress beats must never run the processor");
@@ -388,7 +410,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "ping must not run Claude — daemon handles it directly");
@@ -509,7 +531,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get(),
             "NO_REPLY inbound must not invoke the processor");
@@ -534,7 +556,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(0, proc.processCount.get());
         assertEquals(List.of(1001), brain.archived);
@@ -579,7 +601,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(2, proc.processCount.get(),
             "exactly the 2 actions must reach the processor — no auto-loop, "
@@ -621,7 +643,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(MessagePoller.MAX_TURNS_PER_THREAD, proc.processCount.get(),
             "exactly MAX_TURNS_PER_THREAD (=20) actions must process; the 21st is dropped");
@@ -649,7 +671,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         // First 20 process; messages 21..25 (5 of them) are dropped.
         assertEquals(20, proc.processCount.get());
@@ -696,7 +718,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(20, proc.processCount.get(),
             "20 actions must process — progress beats don't count toward the cap");
@@ -766,7 +788,7 @@ class MessagePollerTest {
         // First poll: process the message, cache populated with real response.
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6000, 42L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
         assertEquals(1, proc.processCount.get(),
             "first inbound must reach the processor");
 
@@ -776,7 +798,7 @@ class MessagePollerTest {
         brain.inbox.clear();
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6001, 42L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
 
         // Acceptance: processor called exactly once across both polls.
         assertEquals(1, proc.processCount.get(),
@@ -822,7 +844,7 @@ class MessagePollerTest {
             6101, 42L, "macmini", "linuxserver",
             stampAction("second turn", "macmini", "macmini:42:2"), "pending"));
 
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(2, proc.processCount.get(),
             "distinct seq_ids on the same thread must both reach the processor");
@@ -850,7 +872,7 @@ class MessagePollerTest {
 
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6200, 99L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
         assertEquals(1, proc.processCount.get());
 
         // Sentinel must now be present (set by MessagePoller post-success).
@@ -865,7 +887,7 @@ class MessagePollerTest {
         brain.inbox.clear();
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6201, 99L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(1, proc.processCount.get(),
             "duplicate must NOT re-invoke the processor");
@@ -893,14 +915,14 @@ class MessagePollerTest {
 
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6300, 33L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
         assertEquals(1, proc.processCount.get());
 
         brain.drained = false;
         brain.inbox.clear();
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6301, 33L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(2, proc.processCount.get(),
             "no seq_id ⇒ no dedup key ⇒ both copies must be processed");
@@ -927,7 +949,7 @@ class MessagePollerTest {
         // First poll: process once.
         brain.inbox.add(new OpenBrainStore.PendingMessage(
             6400, 88L, "macmini", "linuxserver", content, "pending"));
-        poller.triggerPoll();
+        pump(poller);
         assertEquals(1, proc.processCount.get());
 
         // 25 duplicates over subsequent polls — would otherwise have driven
@@ -937,7 +959,7 @@ class MessagePollerTest {
             brain.inbox.clear();
             brain.inbox.add(new OpenBrainStore.PendingMessage(
                 6500 + i, 88L, "macmini", "linuxserver", content, "pending"));
-            poller.triggerPoll();
+            pump(poller);
         }
 
         assertEquals(1, proc.processCount.get(),
@@ -958,7 +980,7 @@ class MessagePollerTest {
 
         CountingProcessor proc = new CountingProcessor();
         MessagePoller poller = new MessagePoller(cfg, brain, proc);
-        poller.triggerPoll();
+        pump(poller);
 
         assertEquals(1, proc.processCount.get(),
             "only the peer direct message should reach the processor");
@@ -966,5 +988,72 @@ class MessagePollerTest {
         assertEquals(List.of(601), brain.archived);
         assertEquals(List.of(600), brain.watermarks,
             "only the skipped self-broadcast advances the watermark here");
+    }
+
+    // ── messenger#27: cross-thread concurrency ───────────────────────────
+
+    /**
+     * Processor that blocks indefinitely for one designated thread_id (the
+     * "slow" task) and completes instantly for any other thread. Lets us prove
+     * a stuck task on one thread doesn't hold up another.
+     */
+    static class GatedProcessor implements MessageProcessor {
+        final long slowThreadId;
+        final CountDownLatch gate        = new CountDownLatch(1);
+        final CountDownLatch slowStarted = new CountDownLatch(1);
+        final AtomicInteger  fastDone    = new AtomicInteger(0);
+
+        GatedProcessor(long slowThreadId) { this.slowThreadId = slowThreadId; }
+
+        @Override
+        public void process(OpenBrainStore.PendingMessage m) throws Exception {
+            if (m.threadId() == slowThreadId) {
+                slowStarted.countDown();
+                gate.await();              // simulate a long-running agent
+            } else {
+                fastDone.incrementAndGet(); // a quick task on another thread
+            }
+        }
+    }
+
+    /**
+     * Core regression for messenger#27: a long-running task on one thread must
+     * NOT block an unrelated short task on a different thread. This is exactly
+     * the thread 811 (FATS project) vs thread 812 (limerick) scenario.
+     */
+    @Test
+    @Timeout(15)
+    void longTaskOnOneThreadDoesNotBlockAnotherThread() throws Exception {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+        String slow = stampAction("long project kickoff", "macmini", "macmini:811:1");
+        String fast = stampAction("quick limerick please", "macmini", "macmini:812:1");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(811, 811L, "macmini", "linuxserver", slow, "pending"));
+        brain.inbox.add(new OpenBrainStore.PendingMessage(812, 812L, "macmini", "linuxserver", fast, "pending"));
+
+        GatedProcessor proc = new GatedProcessor(811L);
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        poller.triggerPoll();  // NOT pump() — we assert mid-flight, while 811 is still blocked
+
+        assertTrue(proc.slowStarted.await(5, TimeUnit.SECONDS),
+            "the slow task (thread 811) should have started");
+
+        // While 811 is wedged, the fast task on thread 812 must still complete.
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (proc.fastDone.get() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, proc.fastDone.get(),
+            "thread 812 must complete while thread 811 is still blocked (messenger#27)");
+        assertTrue(brain.archived.contains(812),
+            "the fast message should be archived even though the slow one is stuck");
+        assertFalse(brain.archived.contains(811),
+            "the slow message must NOT be archived yet — it's still blocked");
+
+        // Release the slow task and confirm everything drains.
+        proc.gate.countDown();
+        assertTrue(poller.awaitProcessingComplete(5000), "all processing should drain");
+        assertTrue(brain.archived.contains(811),
+            "the slow message archives once it finally finishes");
     }
 }
