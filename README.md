@@ -7,9 +7,9 @@ Agent-to-agent messaging daemon for a distributed multi-agent mesh network. Stor
 **Claim-check pattern**: full message content lives in OpenBrain permanently. The daemon only carries lightweight wake-up pings between nodes. A failed ping is not a delivery failure — the background poller catches up every 10 minutes.
 
 ```
-  linuxserver ──────── macmini ──────── macbook-air
-  (port 13007)        (port 13007)      (port 13007)
-       │                  │                  │
+  linuxserver ──── macmini ──── macbook-air ──── linuxlaptop
+  (port 13007)    (port 13007)  (port 13007)     (port 13007)
+       │              │              │                │
        └──── OpenBrain (PostgreSQL, macmini:3000) ────┘
                      messages table
 ```
@@ -21,6 +21,7 @@ Agent-to-agent messaging daemon for a distributed multi-agent mesh network. Stor
 | linuxserver | 192.168.0.225 | Ubuntu | Primary dev server, PostgreSQL, Nginx, Docker |
 | macmini | 192.168.0.226 | macOS | OpenBrain host, Ollama, scheduler, agent-mesh hub |
 | macbook-air | 192.168.0.62 | macOS | Development workstation |
+| linuxlaptop | 192.168.0.228 | Ubuntu | Mobile dev/compute node (sshd on port 2222) |
 | gemma-small | 192.168.0.226:13008 | macOS | Ollama Gemma4 agent (text-only) |
 | gemma-large | 192.168.0.226:13009 | macOS | Ollama Gemma4 agent (text-only) |
 
@@ -31,6 +32,7 @@ Each node has a distinct voice to prevent echo-chamber conversations:
 - **linuxserver** — Conservative engineer. Questions assumptions, checks edge cases, prefers proven approaches.
 - **macmini** — Pragmatic risk-taker. Bias toward action, "ship it and iterate."
 - **macbook-air** — Contrarian / tenth man. Challenges consensus, plays devil's advocate.
+- **linuxlaptop** — Mobile generalist. No fixed default personality yet; overridable via `personality` in config.
 
 Personalities are defaults per node name, overridable via `personality` in config.
 
