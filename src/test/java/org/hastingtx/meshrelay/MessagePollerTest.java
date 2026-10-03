@@ -1056,4 +1056,97 @@ class MessagePollerTest {
         assertTrue(brain.archived.contains(811),
             "the slow message archives once it finally finishes");
     }
+
+    // ── issue #31 A: Throwable (Error) must not strand a message ────────────
+
+    /**
+     * A processor that throws an {@link AssertionError} (or any {@code Error}
+     * not caught by {@code catch (Exception)}) must trigger the
+     * resetDelivered → dead-letter recovery path, not leave the message
+     * stranded in "delivered" limbo.
+     *
+     * <p>Before the fix, {@code Error} escaped {@code processClaimed}'s
+     * {@code catch (Exception)} and was only caught by {@code dispatch}'s
+     * last-resort guard — which only logged and removed the inFlight entry,
+     * leaving the message permanently stuck in "delivered".
+     */
+    @Test
+    @Timeout(10)
+    void processorErrorTriggersDeadLetterNotStrand() {
+        PeerConfig cfg = testConfig("linuxserver");
+
+        final List<Integer> resetCalls     = new CopyOnWriteArrayList<>();
+        final List<Integer> deadLetterIds  = new CopyOnWriteArrayList<>();
+
+        RecordingStore brain = new RecordingStore(cfg) {
+            @Override
+            public boolean resetDelivered(int id) {
+                resetCalls.add(id);
+                return false; // mark_pending unavailable → take dead-letter path
+            }
+            @Override
+            public void storeDeadLetter(PendingMessage msg, String reason) {
+                deadLetterIds.add(msg.messageId());
+            }
+        };
+
+        String content = stampAction("trigger an Error", "macmini", "macmini:9001:1");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            9001, 9001L, "macmini", "linuxserver", content, "pending"));
+
+        MessagePoller poller = new MessagePoller(cfg, brain,
+            msg -> { throw new AssertionError("simulated JVM Error"); });
+        pump(poller);
+
+        assertFalse(resetCalls.isEmpty(),
+            "Error thrown by processor must trigger resetDelivered — not silently strand");
+        assertEquals(List.of(9001), brain.archived,
+            "dead-letter path must archive the message");
+        assertEquals(List.of(9001), deadLetterIds,
+            "storeDeadLetter must be called when resetDelivered returns false");
+        assertEquals(0, poller.inFlightCount(),
+            "inFlight must be clear — no orphaned entry after Error");
+    }
+
+    // ── issue #31 B: RejectedExecutionException must not abort poll batch ───
+
+    /**
+     * When the processing pool is shut down ({@code stop()} called) while
+     * messages are being dispatched, {@code thenRunAsync} throws
+     * {@link RejectedExecutionException}. The remaining messages in the batch
+     * must still be reached, and no inFlight entries must be orphaned.
+     *
+     * <p>Before the fix, the exception propagated through
+     * {@code threadChains.compute()} and out of {@code dispatch()}, aborting
+     * the for-loop in {@code poll()} and leaving any already-added inFlight
+     * entries stranded until daemon restart.
+     */
+    @Test
+    @Timeout(10)
+    void rejectedExecutionOnStoppedPoolDoesNotAbortBatchOrOrphanInFlight() {
+        PeerConfig cfg = testConfig("linuxserver");
+        RecordingStore brain = new RecordingStore(cfg);
+
+        // Two messages; with the pre-fix bug, the first rejection aborts the
+        // loop so the second is never even reached.
+        String c1 = stampAction("message 1", "macmini", "macmini:8001:1");
+        String c2 = stampAction("message 2", "macmini", "macmini:8002:1");
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            8001, 8001L, "macmini", "linuxserver", c1, "pending"));
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            8002, 8002L, "macmini", "linuxserver", c2, "pending"));
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+
+        // Shut down the pool before dispatching — simulates the race where
+        // stop() fires while poll() is mid-batch.
+        poller.stop();
+
+        assertDoesNotThrow(poller::triggerPoll,
+            "RejectedExecutionException must not escape poll() — batch must continue");
+
+        assertEquals(0, poller.inFlightCount(),
+            "inFlight must be empty — no orphaned entries after pool-shutdown rejection");
+    }
 }
