@@ -650,8 +650,8 @@ public class MessagePoller implements Runnable {
                 + " total_processed=" + processed);
         } catch (Throwable t) {
             if (t instanceof InterruptedException) Thread.currentThread().interrupt();
-            log.warning("Failed to process message thread_id=" + threadId
-                + " messageId=" + msg.messageId() + ": " + t.getMessage());
+            log.log(Level.WARNING, "Failed to process message thread_id=" + threadId
+                + " messageId=" + msg.messageId(), t);
             // Return the message to pending so it can be retried (resetDelivered
             // calls mark_pending). Only if that reset is unavailable do we
             // dead-letter: archive to clear the "delivered" limbo, then log to
