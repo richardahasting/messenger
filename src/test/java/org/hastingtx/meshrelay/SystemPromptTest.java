@@ -38,6 +38,16 @@ class SystemPromptTest {
         }
 
         @Test
+        void promptSaysFinalOutputIsTheInThreadReply() {
+            // Issue #36: agents answered with msg_relay (new thread), which
+            // dodges NO_REPLY and caused a chatter storm.
+            String prompt = buildTestPrompt("macbook-air", "linuxserver", 1171, true);
+            assertTrue(prompt.contains("your final output IS the reply"));
+            assertTrue(prompt.contains("on this thread (#1171)"));
+            assertTrue(prompt.contains("Do **NOT** call `msg_relay` / `send_message` to linuxserver"));
+        }
+
+        @Test
         void promptContainsSenderInfo() {
             String prompt = buildTestPrompt("linuxserver", "macmini", 462, true);
             assertTrue(prompt.contains("from **macmini**"));
