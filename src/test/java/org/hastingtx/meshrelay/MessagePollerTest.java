@@ -1149,4 +1149,91 @@ class MessagePollerTest {
         assertEquals(0, poller.inFlightCount(),
             "inFlight must be empty — no orphaned entries after pool-shutdown rejection");
     }
+
+    /**
+     * Store whose inbox behaves like OpenBrain's across polls: every poll
+     * returns the messages not yet delivered or archived (issue #36 needs a
+     * second poll to see what the rate limiter left behind).
+     */
+    static class RepollingStore extends RecordingStore {
+        RepollingStore(PeerConfig cfg) { super(cfg); }
+
+        @Override
+        public List<PendingMessage> pollPendingMessages(String nodeName) {
+            return inbox.stream()
+                .filter(m -> !delivered.contains(m.messageId()) && !archived.contains(m.messageId()))
+                .toList();
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void rateLimitedMessageIsDeferredNotArchived() {
+        // Issue #36: the 4th action from one sender inside the 10-minute window
+        // used to be archived without processing — a legitimate request lost
+        // for good. It must instead stay pending (neither claimed nor archived)
+        // across polls until the window frees up.
+        PeerConfig cfg = testConfig("macbook-air");
+        RepollingStore brain = new RepollingStore(cfg);
+        for (int i = 1; i <= 4; i++) {
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                5000 + i, 5000L + i, "linuxserver", "macbook-air",
+                stampAction("request #" + i, "linuxserver", "linuxserver:-1:" + i), "pending"));
+        }
+
+        CountingProcessor proc = new CountingProcessor();
+        MessagePoller poller = new MessagePoller(cfg, brain, proc);
+        pump(poller);
+        pump(poller);
+        pump(poller);
+
+        assertEquals(3, proc.processCount.get(),
+            "only RATE_LIMIT_MAX (=3) actions process inside the window");
+        assertFalse(brain.archived.contains(5004),
+            "the over-limit message must NOT be archived — that silently drops it");
+        assertFalse(brain.delivered.contains(5004),
+            "the over-limit message must not be claimed while deferred");
+        assertTrue(brain.pollPendingMessages("macbook-air").stream()
+                .anyMatch(m -> m.messageId() == 5004),
+            "the over-limit message must still be pending for a later poll");
+    }
+
+    @Test
+    @Timeout(30)
+    void deferredMessageDoesNotInflateThreadTurnCount() {
+        // A deferred message is re-seen on every poll. Each sighting counts a
+        // turn before the rate-limit check, so without the take-back a message
+        // deferred for long enough would trip MAX_TURNS_PER_THREAD and be
+        // dropped anyway.
+        PeerConfig cfg = testConfig("macbook-air");
+        RepollingStore brain = new RepollingStore(cfg);
+        for (int i = 1; i <= 3; i++) {
+            brain.inbox.add(new OpenBrainStore.PendingMessage(
+                6000 + i, 6000L + i, "linuxserver", "macbook-air",
+                stampAction("filler #" + i, "linuxserver", "linuxserver:-1:" + i), "pending"));
+        }
+        brain.inbox.add(new OpenBrainStore.PendingMessage(
+            6100, 61L, "linuxserver", "macbook-air",
+            stampAction("deferred", "linuxserver", "linuxserver:-1:100"), "pending"));
+
+        MessagePoller poller = new MessagePoller(cfg, brain, new CountingProcessor());
+        for (int i = 0; i < MessagePoller.MAX_TURNS_PER_THREAD + 5; i++) {
+            pump(poller);
+        }
+
+        assertEquals(1, poller.incrementThreadCount(61L),
+            "deferrals must not count as turns on the thread");
+        assertFalse(brain.archived.contains(6100),
+            "repeated deferral must never escalate into a MAX_TURNS drop");
+    }
+
+    @Test
+    void decrementThreadCountNeverGoesNegative() {
+        PeerConfig cfg = testConfig("macbook-air");
+        MessagePoller poller = new MessagePoller(cfg, new RecordingStore(cfg), new CountingProcessor());
+        assertEquals(0, poller.decrementThreadCount(42L), "unknown thread stays at 0");
+        poller.incrementThreadCount(42L);
+        assertEquals(0, poller.decrementThreadCount(42L));
+        assertEquals(0, poller.decrementThreadCount(42L), "never below 0");
+    }
 }

@@ -140,6 +140,21 @@ public class SystemPrompt {
         sb.append("Your reply will be delivered back to ").append(fromNode)
           .append(" via the messenger relay.\n\n");
 
+        // Issue #36: agents were answering with msg_relay, which opens a NEW
+        // thread carrying reply=REPLY — the NO_REPLY loop-breaker never
+        // applies, so two agents can bounce answers forever (chatter storm),
+        // and requesters polling their own thread never see the answer.
+        sb.append("**How to reply: your final output IS the reply.** The daemon sends ");
+        sb.append("whatever you finish with back to ").append(fromNode);
+        sb.append(" on this thread (#").append(threadId).append("), marked so it ");
+        sb.append("will not trigger another round. Put everything the sender asked for ");
+        sb.append("— including any requested JSON block, verbatim — in that final output.\n\n");
+        sb.append("- Do **NOT** call `msg_relay` / `send_message` to ").append(fromNode);
+        sb.append(" to answer this message. That opens a new thread the sender is not ");
+        sb.append("watching, and it demands a reply back, which starts a ping-pong loop.\n");
+        sb.append("- Use `msg_relay` only to contact a *different* node, to ask `richard`, ");
+        sb.append("or to start genuinely new work unrelated to this request.\n\n");
+
         sb.append("Messages use OpenBrain's `messages` table. ");
         sb.append("Each message has a `thread_id` grouping the conversation. ");
         sb.append("To read the full thread history:\n\n");

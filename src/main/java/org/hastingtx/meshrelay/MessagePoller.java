@@ -146,6 +146,9 @@ public class MessagePoller implements Runnable {
     /** sender → timestamps of recently processed messages (sliding window). */
     private final ConcurrentHashMap<String, Deque<Instant>> senderTimestamps = new ConcurrentHashMap<>();
 
+    /** Message ids left pending by the rate limiter, so each deferral logs once (#36). */
+    private final Set<Integer> deferredMessages = ConcurrentHashMap.newKeySet();
+
     public MessagePoller(PeerConfig config, OpenBrainStore brain, MessageProcessor processor) {
         this(config, brain, processor, RelaySender.NOOP, new DedupCache());
     }
@@ -398,12 +401,26 @@ public class MessagePoller implements Runnable {
             }
 
             if (isRateLimited(msg.fromNode())) {
-                log.warning("Rate limited sender=" + msg.fromNode()
-                    + " (>" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
-                    + " — archiving thread_id=" + msg.threadId() + " without processing");
-                brain.markArchived(msg.messageId());
+                // Defer, don't drop (issue #36). Archiving here silently lost
+                // legitimate requests during agent chatter storms. Leaving the
+                // message pending still caps Claude invocations per sender —
+                // a later poll processes it once the window frees up. Undo the
+                // turn counted above so repeated deferrals can't push the
+                // thread over MAX_TURNS_PER_THREAD.
+                decrementThreadCount(msg.threadId());
+                if (deferredMessages.add(msg.messageId())) {
+                    log.warning("Rate limited sender=" + msg.fromNode()
+                        + " (>=" + RATE_LIMIT_MAX + " msgs/" + RATE_LIMIT_WINDOW.toMinutes() + "m)"
+                        + " — deferring message_id=" + msg.messageId()
+                        + " thread_id=" + msg.threadId() + " (left pending)");
+                }
                 continue;
             }
+            if (deferredMessages.remove(msg.messageId())) {
+                log.info("Rate limit cleared — processing deferred message_id="
+                    + msg.messageId() + " thread_id=" + msg.threadId());
+            }
+            recordAdmitted(msg.fromNode());
             dispatch(msg);
         }
     }
@@ -470,6 +487,16 @@ public class MessagePoller implements Runnable {
     int incrementThreadCount(long threadId) {
         return threadCounters.computeIfAbsent(threadId, id -> new AtomicInteger(0))
                              .incrementAndGet();
+    }
+
+    /**
+     * Take back a turn counted by {@link #incrementThreadCount} for a message
+     * that was deferred rather than handled (issue #36). Never goes below 0.
+     * Package-private for testing.
+     */
+    int decrementThreadCount(long threadId) {
+        AtomicInteger c = threadCounters.get(threadId);
+        return c == null ? 0 : c.updateAndGet(n -> Math.max(0, n - 1));
     }
 
     /**
@@ -589,8 +616,13 @@ public class MessagePoller implements Runnable {
         }
     }
 
-    /** Record that a message from this sender was processed. */
-    private void recordProcessed(String sender) {
+    /**
+     * Record that a message from this sender was admitted for processing.
+     * Recorded at admission, not on completion (issue #36): processing is
+     * asynchronous, so counting completions let every message in one poll
+     * batch pass the limit check before any of them was counted.
+     */
+    private void recordAdmitted(String sender) {
         Deque<Instant> timestamps = senderTimestamps.computeIfAbsent(sender, k -> new ArrayDeque<>());
         synchronized (timestamps) {
             timestamps.addLast(Instant.now());
@@ -643,7 +675,6 @@ public class MessagePoller implements Runnable {
                     msg.fromNode(), msg.threadId(), seqId);
                 if (!dedupCache.contains(key)) dedupCache.putSentinel(key);
             }
-            recordProcessed(msg.fromNode());
             int processed = totalProcessed.incrementAndGet();
             log.info("Processed message thread_id=" + threadId
                 + " from=" + msg.fromNode()
