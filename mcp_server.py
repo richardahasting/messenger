@@ -24,18 +24,23 @@ MESSENGER_URL = "http://localhost:13007"
 mcp = FastMCP("messenger")
 
 
+def _check(r: httpx.Response) -> dict:
+    """Raise with the daemon's error body included — raise_for_status() alone
+    drops it, which turned "Unknown peer: linuxserver" into a bare 404 (#38)."""
+    if r.is_error:
+        raise RuntimeError(f"messenger {r.request.method} {r.request.url.path} "
+                           f"returned {r.status_code}: {r.text.strip()[:500]}")
+    return r.json()
+
+
 def _get(path: str, timeout: int = 10) -> dict:
     with httpx.Client(timeout=timeout) as client:
-        r = client.get(f"{MESSENGER_URL}{path}")
-        r.raise_for_status()
-        return r.json()
+        return _check(client.get(f"{MESSENGER_URL}{path}"))
 
 
 def _post(path: str, data: dict, timeout: int = 30) -> dict:
     with httpx.Client(timeout=timeout) as client:
-        r = client.post(f"{MESSENGER_URL}{path}", json=data)
-        r.raise_for_status()
-        return r.json()
+        return _check(client.post(f"{MESSENGER_URL}{path}", json=data))
 
 
 # --- Messaging ---

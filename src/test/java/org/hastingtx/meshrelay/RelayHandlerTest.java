@@ -283,4 +283,31 @@ class RelayHandlerTest {
         assertEquals("info", RelayHandler.extractKind(stored));
         assertEquals("broadcast text", RelayHandler.extractBody(stored));
     }
+
+    // ── target resolution: self-relay (#38) ───────────────────────────────
+
+    private static PeerConfig configWithPeer(String self, String peer, String peerUrl) {
+        return PeerConfig.parseConfig(
+            "{\"listen_port\":13007,\"peers\":[{\"name\":\"" + peer + "\",\"url\":\"" + peerUrl + "\"}]}",
+            self, "http://brain", "k", "test");
+    }
+
+    @Test
+    void relayToSelfResolvesToOwnListener() {
+        // The OpenBrain peer map never lists the node itself; before #38 this 404'd.
+        PeerConfig cfg = configWithPeer("linuxserver", "macmini", "http://192.168.0.226:13007");
+        assertEquals("http://localhost:13007", RelayHandler.resolveTargetUrl(cfg, "linuxserver"));
+    }
+
+    @Test
+    void relayToPeerResolvesFromPeerMap() {
+        PeerConfig cfg = configWithPeer("linuxserver", "macmini", "http://192.168.0.226:13007");
+        assertEquals("http://192.168.0.226:13007", RelayHandler.resolveTargetUrl(cfg, "macmini"));
+    }
+
+    @Test
+    void relayToUnknownNodeStillUnresolved() {
+        PeerConfig cfg = configWithPeer("linuxserver", "macmini", "http://192.168.0.226:13007");
+        assertNull(RelayHandler.resolveTargetUrl(cfg, "nosuchnode"));
+    }
 }

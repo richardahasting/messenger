@@ -134,8 +134,10 @@ public class RelayHandler implements HttpHandler {
 
         content = stampVersionHeader(content, fromNode, version, kind, v12);
 
-        String targetUrl = config.urlFor(toNode);
+        String targetUrl = resolveTargetUrl(config, toNode);
         if (targetUrl == null) {
+            log.warning("Rejected relay to unknown peer: to=" + toNode + " from=" + fromNode
+                + " (known: " + config.peers.keySet() + ", self: " + config.nodeName + ")");
             sendError(exchange, 404, "Unknown peer: " + toNode);
             return;
         }
@@ -332,6 +334,24 @@ public class RelayHandler implements HttpHandler {
             start++;
         }
         return content.substring(start);
+    }
+
+    /**
+     * Base URL for a relay target, or null if the node is unknown.
+     *
+     * The peer map loaded from OpenBrain never lists the node itself, so a
+     * relay to our own name used to 404 (messenger#38) — which broke local
+     * callers such as the Fieldy dispatcher handing work to this node's
+     * processor. Self resolves to our own listener: the message is stored as
+     * usual and the wake-up lands on our own /wake, which triggers the local
+     * poll. Broadcast is unaffected — it iterates the peer map, not this.
+     * Package-private for testing.
+     */
+    static String resolveTargetUrl(PeerConfig config, String toNode) {
+        if (config.nodeName.equals(toNode)) {
+            return "http://localhost:" + config.listenPort;
+        }
+        return config.urlFor(toNode);
     }
 
     /**
