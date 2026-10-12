@@ -352,6 +352,7 @@ class SystemPromptTest {
                   "node_name": "%s",
                   "openbrain_url": "http://192.168.0.226:3000",
                   "openbrain_key": "test-key-for-unit-tests",
+                  "openbrain_startup_wait_seconds": 0,
                   "listen_port": 13007,
                   "peers": [
                     {"name": "macmini", "url": "http://192.168.0.226:13007"},

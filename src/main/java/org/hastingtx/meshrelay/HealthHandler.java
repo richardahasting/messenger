@@ -11,6 +11,8 @@ import java.time.Instant;
 /**
  * GET /health — returns node status as JSON.
  * Used by peers for liveness probes and by the watchdog.
+ * config_source is "openbrain", "cache" or "local"; anything but "openbrain" means
+ * this instance is running on fallback config and its port/processor may be stale (#35).
  */
 public class HealthHandler implements HttpHandler {
 
@@ -45,6 +47,7 @@ public class HealthHandler implements HttpHandler {
               "node": "%s",
               "version": "%s",
               "processor": "%s",
+              "config_source": "%s",
               "status": "ok",
               "uptime_seconds": %d,
               "peers": %s,
@@ -57,6 +60,7 @@ public class HealthHandler implements HttpHandler {
                 config.nodeName,
                 Version.VERSION,
                 processor.name(),
+                config.source,
                 uptimeSeconds,
                 peerList(),
                 ManagementFactory.getThreadMXBean().getThreadCount(),
